@@ -1,0 +1,11 @@
+[workspace]
+members = ["crates/vbsp"]
+
+[package]
+name = "radiosity"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bsp = { git = "https://github.com/sickle-toolchain/bsp" }
+lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
