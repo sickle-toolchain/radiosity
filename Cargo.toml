@@ -1,6 +1,3 @@
-[workspace]
-members = ["crates/vbsp"]
-
 [package]
 name = "radiosity"
 version = "0.1.0"
