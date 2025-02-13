@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
     let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
 
     let faces = bsp
-        .lump_data::<[Face], _>(if args.hdr {
+        .lump_cast::<[Face], _>(if args.hdr {
             LumpDefinition::FacesHdr
         } else {
             LumpDefinition::Faces
@@ -31,7 +31,7 @@ fn main() -> std::io::Result<()> {
     dbg!(faces.len());
 
     let lighting = bsp
-        .lump_data::<[ColorRGBExp32], _>(if args.hdr {
+        .lump_cast::<[ColorRGBExp32], _>(if args.hdr {
             LumpDefinition::LightingHdr
         } else {
             LumpDefinition::Lighting
@@ -41,7 +41,7 @@ fn main() -> std::io::Result<()> {
     dbg!(lighting.len());
 
     let world_lights = bsp
-        .lump_data::<[ColorRGBExp32], _>(if args.hdr {
+        .lump_cast::<[ColorRGBExp32], _>(if args.hdr {
             LumpDefinition::WorldLightsHdr
         } else {
             LumpDefinition::WorldLights

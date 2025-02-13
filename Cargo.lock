@@ -55,7 +55,7 @@ dependencies = [
 [[package]]
 name = "bsp"
 version = "0.1.0"
-source = "git+https://github.com/sickle-toolchain/bsp#63ee4e384cf26d398f25fcbcd04a296b61f9545f"
+source = "git+https://github.com/sickle-toolchain/bsp#3e5513e6679d9109e149c13768cc4a0c8b730c4a"
 dependencies = [
  "zerocopy",
  "zerocopy-derive",
@@ -122,7 +122,7 @@ checksum = "7943c866cc5cd64cbc25b2e01621d07fa8eb2a1a23160ee81ce38704e97b8ecf"
 [[package]]
 name = "lump-definitions"
 version = "0.1.0"
-source = "git+https://github.com/sickle-toolchain/lump-definitions#1c684bbe68e4571e267391dd35c0b3eb94b8cb31"
+source = "git+https://github.com/sickle-toolchain/lump-definitions#07d09b1292a90dfc1a1506172e77e2b88848d021"
 dependencies = [
  "zerocopy",
  "zerocopy-derive",
