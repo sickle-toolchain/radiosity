@@ -3,8 +3,14 @@ name = "radiosity"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+parallel = ["dep:rayon"]
+
 [dependencies]
 bsp = { git = "https://github.com/sickle-toolchain/bsp" }
 lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
 
 clap = { version = "4.5.29", features = ["derive"] }
+rayon = { version = "1.10.0", optional = true }
+zerocopy = "0.8.20"
