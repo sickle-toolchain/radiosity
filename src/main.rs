@@ -2,14 +2,11 @@ use std::{borrow::Cow, path::PathBuf};
 
 use bsp::Bsp;
 use clap::Parser;
+use glam::Vec3;
 use lump_definitions::source::{
-    ColorRGBExp32, Face, LumpDefinition, Plane, TextureData, TextureInfo, WorldLight,
-    LIGHTMAP_COUNT,
+    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo, WorldLight,
 };
 use zerocopy::IntoBytes;
-
-#[cfg(feature = "parallel")]
-use rayon::prelude::*;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -19,6 +16,75 @@ struct Args {
     /// Use high dynamic range lumps
     #[arg(long)]
     hdr: bool,
+}
+
+pub struct LuxelMapping {
+    lightmap: Lightmap,
+    luxel_origin: Vec3,
+    luxel_to_worldspace: [Vec3; 2],
+    world_to_luxelspace: [Vec3; 2],
+}
+
+impl LuxelMapping {
+    pub fn new(face: &Face, texture_info: &TextureInfo, plane: &Plane) -> Self {
+        let world_to_luxelspace = texture_info.luxels.map(|s| Vec3::from_array(s.xyz));
+
+        let s_luxels = Vec3::from_array(texture_info.luxels[0].xyz);
+        let t_luxels = Vec3::from_array(texture_info.luxels[1].xyz);
+
+        let cross = t_luxels.cross(s_luxels);
+
+        let normal = Vec3::from_array(plane.normal);
+        let det = -normal.dot(cross);
+        assert!(det.abs() >= 1.0e-20, "face vectors parallel to face normal");
+
+        let luxel_to_worldspace = [t_luxels.cross(normal) / det, normal.cross(s_luxels) / det];
+
+        let luxel_origin = -(plane.dist * cross) / det
+            + luxel_to_worldspace[0] * -texture_info.luxels[0].offset
+            + luxel_to_worldspace[1] * -texture_info.luxels[1].offset;
+
+        Self {
+            lightmap: face.lightmap,
+            luxel_origin,
+            luxel_to_worldspace,
+            world_to_luxelspace,
+        }
+    }
+
+    /// Converts lightmap pixel (luxel) coordinates to world space coordinates.
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - The s-coordinate in lightmap pixel space.
+    /// * `t` - The t-coordinate in lightmap pixel space.
+    ///
+    /// # Returns
+    ///
+    /// * `Vec3` - The corresponding world space coordinates.
+    pub fn luxel_to_world(&self, s: f32, t: f32) -> Vec3 {
+        let [s_min, t_min] = self.lightmap.mins;
+        let (s, t) = (s + s_min as f32, t + t_min as f32);
+
+        self.luxel_origin + self.luxel_to_worldspace[0] * s + self.luxel_to_worldspace[1] * t
+    }
+
+    /// Converts world space coordinates to lightmap pixel (luxel) coordinates.
+    ///
+    /// # Arguments
+    ///
+    /// * `world` - The world space coordinates.
+    ///
+    /// # Returns
+    ///
+    /// * `(f32, f32)` - The corresponding lightmap pixel space coordinates (s, t).
+    pub fn world_to_luxel(&self, mut world: Vec3) -> (f32, f32) {
+        world -= self.luxel_origin;
+        let s = world.dot(self.world_to_luxelspace[0]) - self.lightmap.mins[0] as f32;
+        let t = world.dot(self.world_to_luxelspace[1]) - self.lightmap.mins[1] as f32;
+
+        (s, t)
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -51,10 +117,6 @@ fn main() -> std::io::Result<()> {
         .lump_cast::<[TextureInfo], _>(LumpDefinition::TextureInfo)
         .expect("Failed to get LumpDefinition::TextureInfo");
 
-    let texture_data = bsp
-        .lump_cast::<[TextureData], _>(LumpDefinition::TextureData)
-        .expect("Failed to get LumpDefinition::TextureInfo");
-
     let (_, mut lighting) = bsp.lump_mut(if args.hdr {
         LumpDefinition::LightingHdr
     } else {
@@ -65,124 +127,52 @@ fn main() -> std::io::Result<()> {
         .iter_mut()
         .map(|face| {
             let texture_info = &texture_info[face.texture_info_index as usize];
-            let texture_data = &texture_data[texture_info.texture_data as usize];
-
-            let cross = [
-                texture_info.luxels[1][1] * texture_info.luxels[0][2]
-                    - texture_info.luxels[1][2] * texture_info.luxels[0][1],
-                texture_info.luxels[1][2] * texture_info.luxels[0][0]
-                    - texture_info.luxels[1][0] * texture_info.luxels[0][2],
-                texture_info.luxels[1][0] * texture_info.luxels[0][1]
-                    - texture_info.luxels[1][1] * texture_info.luxels[0][0],
-            ];
-
             let plane = &planes[face.plane_index as usize];
-            let det = -(plane
-                .normal
-                .iter()
-                .zip(cross.iter())
-                .map(|(x, y)| x * y)
-                .sum::<f32>());
-            assert!(det.abs() >= 1.0e-20, "face vectors parallel to face normal");
 
-            let luxel_to_world = [
-                [
-                    (plane.normal[2] * texture_info.luxels[1][1]
-                        - plane.normal[1] * texture_info.luxels[1][2])
-                        / det,
-                    (plane.normal[0] * texture_info.luxels[1][2]
-                        - plane.normal[2] * texture_info.luxels[1][0])
-                        / det,
-                    (plane.normal[1] * texture_info.luxels[1][0]
-                        - plane.normal[0] * texture_info.luxels[1][1])
-                        / det,
-                ],
-                [
-                    (plane.normal[1] * texture_info.luxels[0][2]
-                        - plane.normal[2] * texture_info.luxels[0][1])
-                        / det,
-                    (plane.normal[2] * texture_info.luxels[0][0]
-                        - plane.normal[0] * texture_info.luxels[0][2])
-                        / det,
-                    (plane.normal[0] * texture_info.luxels[0][1]
-                        - plane.normal[1] * texture_info.luxels[0][0])
-                        / det,
-                ],
-            ];
+            let mapping = LuxelMapping::new(face, texture_info, plane);
 
-            let luxel_origin: [f32; 3] = std::array::from_fn(|index| {
-                -(plane.dist * cross[index]) / det
-                    + luxel_to_world[0][index] * -texture_info.luxels[0][3]
-                    + luxel_to_world[1][index] * -texture_info.luxels[1][3]
-            });
-
+            (face, mapping)
+        })
+        .fold(vec![], |mut acc, (face, mapping)| {
             let width = (face.lightmap.maxs[0] + 1) as usize;
             let height = (face.lightmap.maxs[1] + 1) as usize;
-            let luxel_count = width * height;
 
+            // Accumolate lighting for luxels
             let lightmap = world_lights.iter().fold(
-                vec![
-                    ColorRGBExp32 {
-                        r: (255.0 * texture_data.reflectivity[0]) as u8,
-                        g: (255.0 * texture_data.reflectivity[1]) as u8,
-                        b: (255.0 * texture_data.reflectivity[2]) as u8,
-                        exponent: 0
-                    };
-                    luxel_count * LIGHTMAP_COUNT
-                ],
-                |mut lightmap, light| {
-                    for style in 0..LIGHTMAP_COUNT {
-                        let style_offset = luxel_count * style;
-                        let luxels = &mut lightmap[style_offset..style_offset + luxel_count];
+                vec![ColorRGBExp32::default(); width * height],
+                |mut acc, light| {
+                    (0..height).for_each(|t| {
+                        (0..width).for_each(|s| {
+                            let light_origin = Vec3::from_array(light.origin);
+                            let position = mapping.luxel_to_world(s as f32, t as f32);
 
-                        (0..height).for_each(|t| {
-                            (0..width).for_each(|s| {
-                                let luxel_position: [f32; 3] = std::array::from_fn(|index| {
-                                    luxel_origin[index]
-                                        + luxel_to_world[0][index]
-                                            * (s as i32 + face.lightmap.mins[0]) as f32
-                                        + luxel_to_world[1][index]
-                                            * (t as i32 + face.lightmap.mins[1]) as f32
-                                });
+                            let distance = light_origin.distance(position) as u8;
 
-                                // Check if luxel position is within 128 units of the light origin
-                                if ((light.origin[0] - luxel_position[0]).powi(2)
-                                    + (light.origin[1] - luxel_position[1]).powi(2)
-                                    + (light.origin[2] - luxel_position[2]).powi(2))
-                                .sqrt()
-                                    < 256.0
-                                {
-                                    luxels[s + t * width].exponent = 1;
-                                }
-                            });
+                            // Check if luxel position is within 255 units of the light origin
+                            if distance < u8::MAX {
+                                let color = u8::MAX.saturating_sub(distance);
+                                let luxel = &mut acc[s + t * width];
+
+                                luxel.r = color;
+                                luxel.g = color;
+                                luxel.b = color;
+                                luxel.exponent = 0;
+                            }
                         });
-                    }
+                    });
 
-                    lightmap
+                    acc
                 },
             );
 
-            (face, lightmap)
-        })
-        .fold(Vec::new(), |mut acc, (face, lightmap)| {
-            // Average colors for face
-            acc.extend_from_slice(
-                &[ColorRGBExp32 {
-                    r: 255,
-                    g: 255,
-                    b: 255,
-                    exponent: 0,
-                }; LIGHTMAP_COUNT],
-            );
-
-            face.styles = [0; LIGHTMAP_COUNT];
+            face.styles = [0, 255, 255, 255];
             face.light_offset = (acc.len() * size_of::<ColorRGBExp32>()) as i32;
 
             acc.extend_from_slice(&lightmap);
-
             acc
         });
 
+    // Replace lighting lump
     *lighting = Cow::Owned(lightmaps.as_bytes().to_owned());
 
     // We must drop anything we have mutable access to so
