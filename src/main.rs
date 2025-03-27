@@ -4,9 +4,12 @@ use bsp::Bsp;
 use clap::Parser;
 use glam::Vec3;
 use lump_definitions::source::{
-    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo, WorldLight,
+    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo,
+    WorldLight,
 };
 use zerocopy::IntoBytes;
+
+use radiosity::Associated;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,7 +29,9 @@ pub struct LuxelMapping {
 }
 
 impl LuxelMapping {
-    pub fn new(face: &Face, texture_info: &TextureInfo, plane: &Plane) -> Self {
+    pub fn new<'a>(bsp: &'a Bsp<'a>, face: &Face) -> Self {
+        let plane = <Face as Associated<Plane>>::associated(face, bsp);
+        let texture_info = <Face as Associated<TextureInfo>>::associated(face, bsp);
         let world_to_luxelspace = texture_info.luxels.map(|s| Vec3::from_array(s.xyz));
 
         let s_luxels = Vec3::from_array(texture_info.luxels[0].xyz);
@@ -109,15 +114,7 @@ fn main() -> std::io::Result<()> {
         })
         .expect("Failed to get LumpDefinition::WorldLights");
 
-    let planes = bsp
-        .lump_cast::<[Plane], _>(LumpDefinition::Planes)
-        .expect("Failed to get LumpDefinition::Planes");
-
-    let texture_info = bsp
-        .lump_cast::<[TextureInfo], _>(LumpDefinition::TextureInfo)
-        .expect("Failed to get LumpDefinition::TextureInfo");
-
-    let (_, mut lighting) = bsp.lump_mut(if args.hdr {
+    let mut lighting = bsp.lump_mut(if args.hdr {
         LumpDefinition::LightingHdr
     } else {
         LumpDefinition::Lighting
@@ -125,15 +122,8 @@ fn main() -> std::io::Result<()> {
 
     let lightmaps = faces
         .iter_mut()
-        .map(|face| {
-            let texture_info = &texture_info[face.texture_info_index as usize];
-            let plane = &planes[face.plane_index as usize];
-
-            let mapping = LuxelMapping::new(face, texture_info, plane);
-
-            (face, mapping)
-        })
-        .fold(vec![], |mut acc, (face, mapping)| {
+        .map(|face| (LuxelMapping::new(&bsp, face), face))
+        .fold(vec![], |mut acc, (mapping, face)| {
             let width = (face.lightmap.maxs[0] + 1) as usize;
             let height = (face.lightmap.maxs[1] + 1) as usize;
 
@@ -173,7 +163,7 @@ fn main() -> std::io::Result<()> {
         });
 
     // Replace lighting lump
-    *lighting = Cow::Owned(lightmaps.as_bytes().to_owned());
+    lighting.data = Cow::Owned(lightmaps.as_bytes().to_owned());
 
     // We must drop anything we have mutable access to so
     // write_to_io can gain immutable access.
