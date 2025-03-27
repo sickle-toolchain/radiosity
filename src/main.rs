@@ -57,12 +57,12 @@ impl LuxelMapping {
         }
     }
 
-    /// Converts lightmap pixel (luxel) coordinates to world space coordinates.
+    /// Converts luxel space coordinates to world space coordinates.
     ///
     /// # Arguments
     ///
-    /// * `s` - The s-coordinate in lightmap pixel space.
-    /// * `t` - The t-coordinate in lightmap pixel space.
+    /// * `s` - The s-coordinate in luxel space.
+    /// * `t` - The t-coordinate in luxel space.
     ///
     /// # Returns
     ///
@@ -74,7 +74,7 @@ impl LuxelMapping {
         self.luxel_origin + self.luxel_to_worldspace[0] * s + self.luxel_to_worldspace[1] * t
     }
 
-    /// Converts world space coordinates to lightmap pixel (luxel) coordinates.
+    /// Converts world space coordinates to luxel coordinates.
     ///
     /// # Arguments
     ///
@@ -82,7 +82,7 @@ impl LuxelMapping {
     ///
     /// # Returns
     ///
-    /// * `(f32, f32)` - The corresponding lightmap pixel space coordinates (s, t).
+    /// * `(f32, f32)` - The corresponding luxel space coordinates (s, t).
     pub fn world_to_luxel(&self, mut world: Vec3) -> (f32, f32) {
         world -= self.luxel_origin;
         let s = world.dot(self.world_to_luxelspace[0]) - self.lightmap.mins[0] as f32;
