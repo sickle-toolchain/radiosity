@@ -3,7 +3,7 @@
     ~sickle-toolchain/</a>radiosity
   </h3>
 
-<!-- TODO: add description -->
+BSP Lightmap Compiler
 </div>
 
 ##
