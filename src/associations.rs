@@ -31,15 +31,22 @@ macro_rules! association {
         Ref::map(lump, |lump| &association!(@expression $self, lump, $expression))
     }};
 
+    // Rule for [a]
     (@expression $self:ident, $lump:ident, [$field:ident]) => {
         $lump[$self.$field as usize]
     };
 
+    // Rule for [a..b]
     (@expression $self:ident, $lump:ident, [$field1:ident..$field2:ident]) => {
         $lump[$self.$field1 as usize..$self.$field2 as usize]
+    };
+
+    // Rule for [a..+b] (a .. a + b)
+    (@expression $self:ident, $lump:ident, [$field1:ident..+$field2:ident]) => {
+        $lump[$self.$field1 as usize..$self.$field1 as usize + $self.$field2 as usize]
     };
 }
 
 association!(Face, LumpDefinition::TextureInfo, [texture_info_index] -> TextureInfo);
 association!(Face, LumpDefinition::Planes, [plane_index] -> Plane);
-association!(Face, LumpDefinition::Edges, [edge_index..edge_count] -> [Edge]);
+association!(Face, LumpDefinition::Edges, [edge_index..+edge_count] -> [Edge]);
