@@ -1,31 +1,45 @@
 use std::cell::Ref;
 
 use bsp::Bsp;
-use lump_definitions::source::{Face, LumpDefinition, Plane, TextureInfo};
-
+use lump_definitions::source::{Edge, Face, LumpDefinition, Plane, TextureInfo};
 
 pub trait Associated<T: ?Sized> {
     fn associated<'a>(&self, bsp: &'a Bsp<'a>) -> Ref<'a, T>;
 }
 
-impl Associated<TextureInfo> for Face {
-    fn associated<'a>(&self, bsp: &'a Bsp<'a>) -> Ref<'a, TextureInfo> {
-        let texture_info = bsp
-            .lump_cast::<[TextureInfo], _>(LumpDefinition::TextureInfo)
-            .expect("Failed to get LumpDefinition::TextureInfo");
+macro_rules! association {
+    ($type:ty, $lump:path, $expression:tt -> [$assoc_ty:ty]) => {
+        impl Associated<[$assoc_ty]> for $type {
+            fn associated<'a>(&self, bsp: &'a bsp::Bsp<'a>) -> Ref<'a, [$assoc_ty]> {
+                association!(@inner self, bsp, $lump, $expression -> $assoc_ty)
+            }
+        }
+    };
+    ($type:ty, $lump:path, $expression:tt -> $assoc_ty:ty) => {
+        impl Associated<$assoc_ty> for $type {
+            fn associated<'a>(&self, bsp: &'a bsp::Bsp<'a>) -> Ref<'a, $assoc_ty> {
+                association!(@inner self, bsp, $lump, $expression -> $assoc_ty)
+            }
+        }
+    };
 
-        assert!((self.texture_info_index as usize) < texture_info.len());
-        Ref::map(texture_info, |texture_info| &texture_info[self.texture_info_index as usize])
-    }
+    (@inner $self:ident, $bsp:ident, $lump:path, $expression:tt -> $assoc_ty:ty) => {{
+        let lump = $bsp
+            .lump_cast::<[$assoc_ty], _>($lump)
+            .expect("Failed to get lump");
+
+        Ref::map(lump, |lump| &association!(@expression $self, lump, $expression))
+    }};
+
+    (@expression $self:ident, $lump:ident, [$field:ident]) => {
+        $lump[$self.$field as usize]
+    };
+
+    (@expression $self:ident, $lump:ident, [$field1:ident..$field2:ident]) => {
+        $lump[$self.$field1 as usize..$self.$field2 as usize]
+    };
 }
 
-impl Associated<Plane> for Face {
-    fn associated<'a>(&self, bsp: &'a Bsp<'a>) -> Ref<'a, Plane> {
-        let planes = bsp
-            .lump_cast::<[Plane], _>(LumpDefinition::Planes)
-            .expect("Failed to get LumpDefinition::Planes");
-
-        assert!((self.plane_index as usize) < planes.len());
-        Ref::map(planes, |planes| &planes[self.plane_index as usize])
-    }
-}
+association!(Face, LumpDefinition::TextureInfo, [texture_info_index] -> TextureInfo);
+association!(Face, LumpDefinition::Planes, [plane_index] -> Plane);
+association!(Face, LumpDefinition::Edges, [edge_index..edge_count] -> [Edge]);
