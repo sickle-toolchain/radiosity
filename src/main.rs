@@ -4,8 +4,7 @@ use bsp::Bsp;
 use clap::Parser;
 use glam::Vec3;
 use lump_definitions::source::{
-    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo,
-    WorldLight,
+    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo, WorldLight,
 };
 use zerocopy::IntoBytes;
 
@@ -127,7 +126,7 @@ fn main() -> std::io::Result<()> {
             let width = (face.lightmap.maxs[0] + 1) as usize;
             let height = (face.lightmap.maxs[1] + 1) as usize;
 
-            // Accumolate lighting for luxels
+            // Accumulate lighting for luxels
             let lightmap = world_lights.iter().fold(
                 vec![ColorRGBExp32::default(); width * height],
                 |mut acc, light| {
