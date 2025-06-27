@@ -1,4 +1,5 @@
 #![feature(asm_experimental_arch)]
+#![allow(unexpected_cfgs)]
 #![cfg_attr(target_arch = "spirv", no_std)]
 
 use spirv_std::{
