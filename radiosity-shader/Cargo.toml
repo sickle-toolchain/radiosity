@@ -1,0 +1,12 @@
+cargo-features = ["edition2024"]
+
+[package]
+name = "radiosity-shader"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["dylib", "lib"]
+
+[dependencies]
+spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu" }

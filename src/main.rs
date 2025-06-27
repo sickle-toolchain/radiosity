@@ -1,14 +1,11 @@
-use std::{borrow::Cow, path::PathBuf};
+use std::{collections::HashSet, error::Error, ffi::CStr, os::raw::c_char, path::PathBuf};
 
+use ash::{prelude::VkResult, vk};
 use bsp::Bsp;
 use clap::Parser;
-use glam::Vec3;
-use lump_definitions::source::{
-    ColorRGBExp32, Face, Lightmap, LumpDefinition, Plane, TextureInfo, WorldLight,
-};
-use zerocopy::IntoBytes;
 
-use radiosity::Associated;
+#[allow(dead_code)]
+const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -20,157 +17,153 @@ struct Args {
     hdr: bool,
 }
 
-pub struct LuxelMapping {
-    lightmap: Lightmap,
-    luxel_origin: Vec3,
-    luxel_to_worldspace: [Vec3; 2],
-    world_to_luxelspace: [Vec3; 2],
+trait ApplicationInfoExt {
+    fn application_from_env(self) -> Self;
 }
 
-impl LuxelMapping {
-    pub fn new<'a>(bsp: &'a Bsp<'a>, face: &Face) -> Self {
-        let plane = <Face as Associated<Plane>>::associated(face, bsp);
-        let texture_info = <Face as Associated<TextureInfo>>::associated(face, bsp);
-        let world_to_luxelspace = texture_info.luxels.map(|s| Vec3::from_array(s.xyz));
+impl<'a> ApplicationInfoExt for vk::ApplicationInfo<'a> {
+    fn application_from_env(self) -> Self {
+        let application_name =
+            CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_NAME"), "\0").as_bytes())
+                .expect("invalid package name");
 
-        let s_luxels = Vec3::from_array(texture_info.luxels[0].xyz);
-        let t_luxels = Vec3::from_array(texture_info.luxels[1].xyz);
+        let major = env!("CARGO_PKG_VERSION_MAJOR")
+            .parse::<u32>()
+            .expect("invalid major version");
+        let minor = env!("CARGO_PKG_VERSION_MINOR")
+            .parse::<u32>()
+            .expect("invalid minor version");
+        let patch = env!("CARGO_PKG_VERSION_PATCH")
+            .parse::<u32>()
+            .expect("invalid patch version");
 
-        let cross = t_luxels.cross(s_luxels);
-
-        let normal = Vec3::from_array(plane.normal);
-        let det = -normal.dot(cross);
-        assert!(det.abs() >= 1.0e-20, "face vectors parallel to face normal");
-
-        let luxel_to_worldspace = [t_luxels.cross(normal) / det, normal.cross(s_luxels) / det];
-
-        let luxel_origin = -(plane.dist * cross) / det
-            + luxel_to_worldspace[0] * -texture_info.luxels[0].offset
-            + luxel_to_worldspace[1] * -texture_info.luxels[1].offset;
-
-        Self {
-            lightmap: face.lightmap,
-            luxel_origin,
-            luxel_to_worldspace,
-            world_to_luxelspace,
-        }
-    }
-
-    /// Converts luxel space coordinates to world space coordinates.
-    ///
-    /// # Arguments
-    ///
-    /// * `s` - The s-coordinate in luxel space.
-    /// * `t` - The t-coordinate in luxel space.
-    ///
-    /// # Returns
-    ///
-    /// * `Vec3` - The corresponding world space coordinates.
-    pub fn luxel_to_world(&self, s: f32, t: f32) -> Vec3 {
-        let [s_min, t_min] = self.lightmap.mins;
-        let (s, t) = (s + s_min as f32, t + t_min as f32);
-
-        self.luxel_origin + self.luxel_to_worldspace[0] * s + self.luxel_to_worldspace[1] * t
-    }
-
-    /// Converts world space coordinates to luxel coordinates.
-    ///
-    /// # Arguments
-    ///
-    /// * `world` - The world space coordinates.
-    ///
-    /// # Returns
-    ///
-    /// * `(f32, f32)` - The corresponding luxel space coordinates (s, t).
-    pub fn world_to_luxel(&self, mut world: Vec3) -> (f32, f32) {
-        world -= self.luxel_origin;
-        let s = world.dot(self.world_to_luxelspace[0]) - self.lightmap.mins[0] as f32;
-        let t = world.dot(self.world_to_luxelspace[1]) - self.lightmap.mins[1] as f32;
-
-        (s, t)
+        self.application_name(application_name)
+            .application_version(vk::make_api_version(0, major, minor, patch))
     }
 }
-
-fn main() -> std::io::Result<()> {
+fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     let contents = std::fs::read(args.bsp_path)?;
-    let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
+    let _bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
 
-    let mut faces = bsp
-        .lump_cast_mut::<[Face], _>(if args.hdr {
-            LumpDefinition::FacesHdr
-        } else {
-            LumpDefinition::Faces
-        })
-        .expect("Failed to get LumpDefinition::Faces");
+    let entry = unsafe { ash::Entry::load() }?;
 
-    let world_lights = bsp
-        .lump_cast::<[WorldLight], _>(if args.hdr {
-            LumpDefinition::WorldLightsHdr
-        } else {
-            LumpDefinition::WorldLights
-        })
-        .expect("Failed to get LumpDefinition::WorldLights");
+    let instance = {
+        let application_info = vk::ApplicationInfo::default()
+            .application_from_env()
+            .engine_name(c"No Engine")
+            .engine_version(vk::make_api_version(0, 1, 0, 0))
+            .api_version(vk::API_VERSION_1_2);
 
-    let mut lighting = bsp.lump_mut(if args.hdr {
-        LumpDefinition::LightingHdr
-    } else {
-        LumpDefinition::Lighting
-    });
+        let instance_create_info =
+            vk::InstanceCreateInfo::default().application_info(&application_info);
 
-    let lightmaps = faces
-        .iter_mut()
-        .map(|face| (LuxelMapping::new(&bsp, face), face))
-        .fold(vec![], |mut acc, (mapping, face)| {
-            let width = (face.lightmap.maxs[0] + 1) as usize;
-            let height = (face.lightmap.maxs[1] + 1) as usize;
+        unsafe { entry.create_instance(&instance_create_info, None) }
+            .expect("failed to create instance!")
+    };
 
-            // Accumulate lighting for luxels
-            let lightmap = world_lights.iter().fold(
-                vec![ColorRGBExp32::default(); width * height],
-                |mut acc, light| {
-                    (0..height).for_each(|t| {
-                        (0..width).for_each(|s| {
-                            let light_origin = Vec3::from_array(light.origin);
-                            let position = mapping.luxel_to_world(s as f32, t as f32);
+    let (physical_device, queue_family_index) = pick_physical_device_and_queue_family_indices(
+        &instance,
+        &[
+            ash::khr::acceleration_structure::NAME,
+            ash::khr::deferred_host_operations::NAME,
+            ash::khr::ray_tracing_pipeline::NAME,
+        ],
+    )?
+    .unwrap();
 
-                            let distance = light_origin.distance(position) as u8;
+    let device: ash::Device = {
+        let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(queue_family_index)
+            .queue_priorities(&[1.0])];
 
-                            // Check if luxel position is within 255 units of the light origin
-                            if distance < u8::MAX {
-                                let color = u8::MAX.saturating_sub(distance);
-                                let luxel = &mut acc[s + t * width];
+        let mut features2 = vk::PhysicalDeviceFeatures2::default();
+        unsafe {
+            (instance.fp_v1_1().get_physical_device_features2)(physical_device, &mut features2);
+        };
 
-                                luxel.r = color;
-                                luxel.g = color;
-                                luxel.b = color;
-                                luxel.exponent = 0;
-                            }
-                        });
-                    });
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .vulkan_memory_model(true);
 
-                    acc
-                },
-            );
+        let mut as_feature = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+            .acceleration_structure(true);
 
-            face.styles = [0, 255, 255, 255];
-            face.light_offset = (acc.len() * size_of::<ColorRGBExp32>()) as i32;
+        let mut raytracing_pipeline =
+            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
-            acc.extend_from_slice(&lightmap);
-            acc
-        });
+        let enabled_extension_names = [
+            ash::khr::acceleration_structure::NAME.as_ptr(),
+            ash::khr::deferred_host_operations::NAME.as_ptr(),
+            ash::khr::ray_tracing_pipeline::NAME.as_ptr(),
+            vk::KHR_SPIRV_1_4_NAME.as_ptr(),
+            vk::EXT_SCALAR_BLOCK_LAYOUT_NAME.as_ptr(),
+            vk::KHR_GET_MEMORY_REQUIREMENTS2_NAME.as_ptr(),
+        ];
 
-    // Replace lighting lump
-    lighting.data = Cow::Owned(lightmaps.as_bytes().to_owned());
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .push_next(&mut features2)
+            .push_next(&mut features12)
+            .push_next(&mut as_feature)
+            .push_next(&mut raytracing_pipeline)
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&enabled_extension_names);
 
-    // We must drop anything we have mutable access to so
-    // write_to_io can gain immutable access.
-    drop(faces);
-    drop(lighting);
+        unsafe { instance.create_device(physical_device, &device_create_info, None) }
+            .expect("Failed to create logical Device!")
+    };
 
-    bsp.write_to_io(&mut std::fs::File::create("out.bsp").unwrap())
-        .expect("writing to io failed");
+    // ...
+
+    unsafe {
+        device.destroy_device(None);
+    }
+
+    unsafe {
+        instance.destroy_instance(None);
+    }
 
     Ok(())
+}
+
+fn pick_physical_device_and_queue_family_indices(
+    instance: &ash::Instance,
+    extensions: &[&CStr],
+) -> VkResult<Option<(vk::PhysicalDevice, u32)>> {
+    let picked = unsafe { instance.enumerate_physical_devices() }?
+        .into_iter()
+        .find_map(|physical_device| {
+            let has_all_extesions =
+                unsafe { instance.enumerate_device_extension_properties(physical_device) }.map(
+                    |exts| {
+                        let set: HashSet<&CStr> = exts
+                            .iter()
+                            .map(|ext| unsafe {
+                                CStr::from_ptr(&ext.extension_name as *const c_char)
+                            })
+                            .collect();
+
+                        extensions.iter().all(|ext| set.contains(ext))
+                    },
+                );
+            if has_all_extesions != Ok(true) {
+                return None;
+            }
+
+            let graphics_family =
+                unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+                    .into_iter()
+                    .enumerate()
+                    .find(|(_, device_properties)| {
+                        device_properties.queue_count > 0
+                            && device_properties
+                                .queue_flags
+                                .contains(vk::QueueFlags::GRAPHICS)
+                    });
+
+            graphics_family.map(|(i, _)| (physical_device, i as u32))
+        });
+
+    Ok(picked)
 }

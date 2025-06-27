@@ -1,3 +1,6 @@
+[workspace]
+members = ["radiosity-shader"]
+
 [package]
 name = "radiosity"
 version = "0.1.0"
@@ -13,3 +16,8 @@ lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions
 clap = { version = "4.5.29", features = ["derive"] }
 zerocopy = "0.8.20"
 glam = "0.30.0"
+ash = "0.38.0"
+png = "0.17.16"
+
+[build-dependencies]
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }
