@@ -52,8 +52,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let instance = {
         let application_info = vk::ApplicationInfo::default()
             .application_from_env()
-            .engine_name(c"No Engine")
-            .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::API_VERSION_1_2);
 
         let instance_create_info =
