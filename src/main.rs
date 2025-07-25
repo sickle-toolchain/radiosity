@@ -1,8 +1,10 @@
+#![feature(gen_blocks)]
 use std::{collections::HashSet, error::Error, ffi::CStr, os::raw::c_char, path::PathBuf};
 
-use ash::{prelude::VkResult, vk};
+use ash::{prelude::VkResult, util::Align, vk};
 use bsp::Bsp;
 use clap::Parser;
+use lump_definitions::source::{LumpDefinition, Vertex};
 
 #[allow(dead_code)]
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
@@ -41,11 +43,40 @@ impl<'a> ApplicationInfoExt for vk::ApplicationInfo<'a> {
             .application_version(vk::make_api_version(0, major, minor, patch))
     }
 }
+
+trait PhysicalDeviceMemoryPropertiesExt {
+    fn mem_ty_idx(
+        &self,
+        required_bits: u32,
+        required_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32>;
+}
+
+impl PhysicalDeviceMemoryPropertiesExt for vk::PhysicalDeviceMemoryProperties {
+    fn mem_ty_idx(
+        &self,
+        required_bits: u32,
+        required_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        for idx in 0..self.memory_type_count {
+            let memory_properties = self.memory_types[idx as usize].property_flags;
+
+            if (required_bits & (1 << idx)) == 1
+                && (memory_properties & required_properties) == required_properties
+            {
+                return Some(idx);
+            }
+        }
+
+        None
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
 
     let contents = std::fs::read(args.bsp_path)?;
-    let _bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
+    let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
 
     let entry = unsafe { ash::Entry::load() }?;
 
@@ -83,6 +114,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .map(|(idx, _)| idx as u32)
             .expect("Failed to find queue family index");
+
+    let device_memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
     let device: ash::Device = {
         let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
@@ -126,6 +160,88 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
 
     // ...
+
+    let vertices = bsp
+        .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
+        .expect("Failed to get vertices lump");
+
+    let vertex_buffer = {
+        let buffer_size = (std::mem::size_of::<Vertex>() * vertices.len()) as u64;
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(buffer_size)
+            .usage(
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+            )
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }
+            .expect("Failed to create vertex buffer");
+
+        let memory_req = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let mut memory_allocate_flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+
+        let allocate_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(memory_req.size)
+            .memory_type_index(
+                device_memory_properties
+                    .mem_ty_idx(
+                        memory_req.memory_type_bits,
+                        vk::MemoryPropertyFlags::HOST_VISIBLE
+                            | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    )
+                    .expect("Failed to get required memory type"),
+            )
+            .push_next(&mut memory_allocate_flags_info);
+
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
+            .expect("Failed to allocate vertex buffer on device");
+
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
+            .expect("Failed to bind vertex buffer to device");
+
+        // Write vertices to vertex_buffer
+        unsafe {
+            let mapped = device.map_memory(memory, 0, buffer_size, vk::MemoryMapFlags::empty())?;
+            let mut slice = Align::new(mapped, std::mem::align_of::<Vertex>() as u64, buffer_size);
+            slice.copy_from_slice(&vertices);
+            device.unmap_memory(memory);
+        }
+
+        buffer
+    };
+
+    // 1. Iterate faces
+    // 2. Get edge vertices
+    // 3. Perform fan triangulation
+    let index_buffer = {};
+
+    let geometry = vk::AccelerationStructureGeometryKHR::default()
+        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+        .geometry(vk::AccelerationStructureGeometryDataKHR {
+            triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: unsafe {
+                        device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer),
+                        )
+                    },
+                })
+                .max_vertex(vertices.len() as u32 - 1)
+                .vertex_stride(std::mem::size_of::<[f32; 3]>() as u64)
+                .vertex_format(vk::Format::R32G32B32_SFLOAT), // .index_data(vk::DeviceOrHostAddressConstKHR {
+                                                              //     device_address: unsafe {
+                                                              //         device.get_buffer_device_address(
+                                                              //             &vk::BufferDeviceAddressInfo::default().buffer(index_buffer),
+                                                              //         )
+                                                              //     },
+                                                              // })
+                                                              // .index_type(vk::IndexType::UINT32),
+        })
+        .flags(vk::GeometryFlagsKHR::OPAQUE);
 
     unsafe {
         device.destroy_device(None);
