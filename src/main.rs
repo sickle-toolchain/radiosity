@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("failed to create instance!")
     };
 
-    let (physical_device, queue_family_index) = pick_physical_device_and_queue_family_indices(
+    let physical_device = find_physical_device(
         &instance,
         &[
             ash::khr::acceleration_structure::NAME,
@@ -69,7 +69,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             ash::khr::ray_tracing_pipeline::NAME,
         ],
     )?
-    .unwrap();
+    .expect("Failed to find physical device");
+
+    let queue_family_index =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
+            .into_iter()
+            .enumerate()
+            .find(|(_, device_properties)| {
+                device_properties.queue_count > 0
+                    && device_properties
+                        .queue_flags
+                        .contains(vk::QueueFlags::GRAPHICS)
+            })
+            .map(|(idx, _)| idx as u32)
+            .expect("Failed to find queue family index");
 
     let device: ash::Device = {
         let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
@@ -125,43 +138,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn pick_physical_device_and_queue_family_indices(
+fn find_physical_device(
     instance: &ash::Instance,
-    extensions: &[&CStr],
-) -> VkResult<Option<(vk::PhysicalDevice, u32)>> {
-    let picked = unsafe { instance.enumerate_physical_devices() }?
+    required_extensions: &[&CStr],
+) -> VkResult<Option<vk::PhysicalDevice>> {
+    let device = unsafe { instance.enumerate_physical_devices() }?
         .into_iter()
-        .find_map(|physical_device| {
-            let has_all_extesions =
-                unsafe { instance.enumerate_device_extension_properties(physical_device) }.map(
-                    |exts| {
-                        let set: HashSet<&CStr> = exts
-                            .iter()
-                            .map(|ext| unsafe {
-                                CStr::from_ptr(&ext.extension_name as *const c_char)
-                            })
-                            .collect();
+        .find(|&physical_device| {
+            unsafe { instance.enumerate_device_extension_properties(physical_device) }
+                .map(|exts| {
+                    let set: HashSet<&CStr> = exts
+                        .iter()
+                        .map(|ext| unsafe { CStr::from_ptr(&ext.extension_name as *const c_char) })
+                        .collect();
 
-                        extensions.iter().all(|ext| set.contains(ext))
-                    },
-                );
-            if has_all_extesions != Ok(true) {
-                return None;
-            }
-
-            let graphics_family =
-                unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
-                    .into_iter()
-                    .enumerate()
-                    .find(|(_, device_properties)| {
-                        device_properties.queue_count > 0
-                            && device_properties
-                                .queue_flags
-                                .contains(vk::QueueFlags::GRAPHICS)
-                    });
-
-            graphics_family.map(|(i, _)| (physical_device, i as u32))
+                    required_extensions.iter().all(|ext| set.contains(ext))
+                })
+                .unwrap_or(false)
         });
 
-    Ok(picked)
+    Ok(device)
 }
