@@ -496,7 +496,7 @@ checksum = "b3bd0dd2cd90571056fdb71f6275fada10131182f84899f4b2a916e565d81d86"
 [[package]]
 name = "lump-definitions"
 version = "0.1.0"
-source = "git+https://github.com/sickle-toolchain/lump-definitions#cac08b75889710d3d0c120694d22350e2f536a80"
+source = "git+https://github.com/sickle-toolchain/lump-definitions#7253beb850fe18737b0c10eaf71f26d805530014"
 dependencies = [
  "zerocopy",
  "zerocopy-derive",
