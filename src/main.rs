@@ -4,7 +4,8 @@ use std::{collections::HashSet, error::Error, ffi::CStr, os::raw::c_char, path::
 use ash::{prelude::VkResult, util::Align, vk};
 use bsp::Bsp;
 use clap::Parser;
-use lump_definitions::source::{LumpDefinition, Vertex};
+use lump_definitions::source::{Edge, Face, LumpDefinition, SurfaceEdge, Vertex};
+use radiosity::Associated;
 
 #[allow(dead_code)]
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
@@ -159,89 +160,233 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("Failed to create logical Device!")
     };
 
+    let graphics_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+
+    let command_pool = {
+        let command_pool_create_info =
+            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+
+        unsafe { device.create_command_pool(&command_pool_create_info, None) }
+            .expect("Failed to create Command Pool!")
+    };
+
+    let acceleration_structure = ash::khr::acceleration_structure::Device::new(&instance, &device);
+
     // ...
 
     let vertices = bsp
         .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
         .expect("Failed to get vertices lump");
 
-    let vertex_buffer = {
-        let buffer_size = (std::mem::size_of::<Vertex>() * vertices.len()) as u64;
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(buffer_size)
-            .usage(
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-            )
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let mut vertex_buffer = BufferResource::new(
+        (std::mem::size_of::<Vertex>() * vertices.len()) as u64,
+        vk::BufferUsageFlags::VERTEX_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        &device,
+        device_memory_properties,
+    )?;
+    vertex_buffer.store(&vertices, &device);
 
-        let buffer = unsafe { device.create_buffer(&buffer_info, None) }
-            .expect("Failed to create vertex buffer");
+    let faces = bsp
+        .lump_cast::<[Face], _>(LumpDefinition::Faces)
+        .expect("Failed to get faces lump");
 
-        let memory_req = unsafe { device.get_buffer_memory_requirements(buffer) };
+    let indices = faces
+        .iter()
+        .flat_map(|face| {
+            let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
+            let indices = surface_edges.into_iter().map(|surface_edge| {
+                <SurfaceEdge as Associated<Edge>>::associated(&surface_edge, &bsp).edge
+                    [(surface_edge.edge_index < 0) as usize]
+            });
 
-        let mut memory_allocate_flags_info =
-            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+            // Perform fan triangulation on list of vertices
+            struct FanTriangulation<I, A>
+            where
+                I: Iterator<Item = A>,
+            {
+                iter: I,
+                v0: Option<A>,
+                prev: Option<A>,
+            }
 
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(memory_req.size)
-            .memory_type_index(
-                device_memory_properties
-                    .mem_ty_idx(
-                        memory_req.memory_type_bits,
-                        vk::MemoryPropertyFlags::HOST_VISIBLE
-                            | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    )
-                    .expect("Failed to get required memory type"),
-            )
-            .push_next(&mut memory_allocate_flags_info);
+            impl<I, A> FanTriangulation<I, A>
+            where
+                I: Iterator<Item = A>,
+            {
+                fn new(mut iter: I) -> Self {
+                    let v0 = iter.next();
+                    let prev = iter.next();
+                    FanTriangulation { iter, v0, prev }
+                }
+            }
 
-        let memory = unsafe { device.allocate_memory(&allocate_info, None) }
-            .expect("Failed to allocate vertex buffer on device");
+            impl<I, A: Copy> Iterator for FanTriangulation<I, A>
+            where
+                I: Iterator<Item = A>,
+            {
+                type Item = [A; 3];
 
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }
-            .expect("Failed to bind vertex buffer to device");
+                fn next(&mut self) -> Option<Self::Item> {
+                    if let Some(current) = self.iter.next() {
+                        let triangle = [self.v0.unwrap(), self.prev.unwrap(), current];
+                        self.prev = Some(current);
+                        Some(triangle)
+                    } else {
+                        None
+                    }
+                }
+            }
 
-        // Write vertices to vertex_buffer
-        unsafe {
-            let mapped = device.map_memory(memory, 0, buffer_size, vk::MemoryMapFlags::empty())?;
-            let mut slice = Align::new(mapped, std::mem::align_of::<Vertex>() as u64, buffer_size);
-            slice.copy_from_slice(&vertices);
-            device.unmap_memory(memory);
-        }
+            FanTriangulation::new(indices).collect::<Vec<_>>()
+        })
+        .flatten()
+        .collect::<Vec<_>>();
 
-        buffer
-    };
-
-    // 1. Iterate faces
-    // 2. Get edge vertices
-    // 3. Perform fan triangulation
-    let index_buffer = {};
+    let mut index_buffer = BufferResource::new(
+        (std::mem::size_of::<u16>() * indices.len()) as u64,
+        vk::BufferUsageFlags::INDEX_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        &device,
+        device_memory_properties,
+    )?;
+    index_buffer.store(&indices, &device);
 
     let geometry = vk::AccelerationStructureGeometryKHR::default()
         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
         .geometry(vk::AccelerationStructureGeometryDataKHR {
             triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: unsafe {
-                        device.get_buffer_device_address(
-                            &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer),
-                        )
-                    },
+                    device_address: vertex_buffer.device_address(&device),
                 })
                 .max_vertex(vertices.len() as u32 - 1)
                 .vertex_stride(std::mem::size_of::<[f32; 3]>() as u64)
-                .vertex_format(vk::Format::R32G32B32_SFLOAT), // .index_data(vk::DeviceOrHostAddressConstKHR {
-                                                              //     device_address: unsafe {
-                                                              //         device.get_buffer_device_address(
-                                                              //             &vk::BufferDeviceAddressInfo::default().buffer(index_buffer),
-                                                              //         )
-                                                              //     },
-                                                              // })
-                                                              // .index_type(vk::IndexType::UINT32),
+                .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                .index_data(vk::DeviceOrHostAddressConstKHR {
+                    device_address: index_buffer.device_address(&device),
+                })
+                .index_type(vk::IndexType::UINT16),
         })
         .flags(vk::GeometryFlagsKHR::OPAQUE);
+
+    let (blas, blas_buffer) = {
+        let build_range_info = vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .first_vertex(0)
+            .primitive_count(indices.len() as u32 / 3)
+            .primitive_offset(0)
+            .transform_offset(0);
+
+        let geometries = [geometry];
+
+        let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .flags(vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE)
+            .geometries(&geometries)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .ty(vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL);
+
+        let mut sizes_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        unsafe {
+            acceleration_structure.get_acceleration_structure_build_sizes(
+                vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                &build_info,
+                &[indices.len() as u32 / 3],
+                &mut sizes_info,
+            )
+        };
+
+        let blas_buffer = BufferResource::new(
+            sizes_info.acceleration_structure_size,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            &device,
+            device_memory_properties,
+        )?;
+
+        let as_create_info = vk::AccelerationStructureCreateInfoKHR::default()
+            .ty(build_info.ty)
+            .size(sizes_info.acceleration_structure_size)
+            .buffer(blas_buffer.buffer)
+            .offset(0);
+
+        let blas =
+            unsafe { acceleration_structure.create_acceleration_structure(&as_create_info, None) }
+                .expect("Failed to create bottom-level acceleration structure");
+
+        build_info.dst_acceleration_structure = blas;
+
+        let scratch_buffer = BufferResource::new(
+            sizes_info.acceleration_structure_size,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            &device,
+            device_memory_properties,
+        )?;
+
+        build_info.scratch_data = vk::DeviceOrHostAddressKHR {
+            device_address: scratch_buffer.device_address(&device),
+        };
+
+        let build_command_buffer = {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(1)
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+
+            let command_buffers =
+                unsafe { device.allocate_command_buffers(&allocate_info) }.unwrap();
+            command_buffers[0]
+        };
+
+        unsafe {
+            device
+                .begin_command_buffer(
+                    build_command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+
+            acceleration_structure.cmd_build_acceleration_structures(
+                build_command_buffer,
+                &[build_info],
+                &[&[build_range_info]],
+            );
+            device.end_command_buffer(build_command_buffer).unwrap();
+            device
+                .queue_submit(
+                    graphics_queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[build_command_buffer])],
+                    vk::Fence::null(),
+                )
+                .expect("queue submit failed");
+
+            device.queue_wait_idle(graphics_queue).unwrap();
+            device.free_command_buffers(command_pool, &[build_command_buffer]);
+            scratch_buffer.destroy(&device);
+        }
+        (blas, blas_buffer)
+    };
+
+    unsafe {
+        device.destroy_command_pool(command_pool, None);
+    }
+
+    unsafe {
+        acceleration_structure.destroy_acceleration_structure(blas, None);
+        // acceleration_structure.destroy_acceleration_structure(top_as, None);
+    }
+
+    blas_buffer.destroy(&device);
+    // top_as_buffer.destroy(&device);
+
+    vertex_buffer.destroy(&device);
+    index_buffer.destroy(&device);
 
     unsafe {
         device.destroy_device(None);
@@ -274,4 +419,90 @@ fn find_physical_device(
         });
 
     Ok(device)
+}
+
+struct BufferResource {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl BufferResource {
+    pub fn new(
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        memory_properties: vk::MemoryPropertyFlags,
+        device: &ash::Device,
+        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    ) -> VkResult<Self> {
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
+
+        let memory_req = unsafe { device.get_buffer_memory_requirements(buffer) };
+
+        let memory_index = device_memory_properties
+            .mem_ty_idx(memory_req.memory_type_bits, memory_properties)
+            .expect("Failed to get memory type");
+
+        let mut allocate_info_builder = vk::MemoryAllocateInfo::default();
+
+        let mut memory_allocate_flags_info =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+
+        if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
+            allocate_info_builder =
+                allocate_info_builder.push_next(&mut memory_allocate_flags_info);
+        }
+
+        let allocate_info = allocate_info_builder
+            .allocation_size(memory_req.size)
+            .memory_type_index(memory_index);
+
+        let memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+
+        unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
+
+        Ok(Self { buffer, memory })
+    }
+
+    fn device_address(&self, device: &ash::Device) -> u64 {
+        unsafe {
+            device.get_buffer_device_address(
+                &vk::BufferDeviceAddressInfo::default().buffer(self.buffer),
+            )
+        }
+    }
+
+    fn store<T: Copy>(&mut self, data: &[T], device: &ash::Device) {
+        unsafe {
+            let size = std::mem::size_of_val(data) as u64;
+            let mapped_ptr = self.map(size, device);
+            let mut mapped_slice = Align::new(mapped_ptr, std::mem::align_of::<T>() as u64, size);
+            mapped_slice.copy_from_slice(data);
+            self.unmap(device);
+        }
+    }
+
+    fn map(&mut self, size: vk::DeviceSize, device: &ash::Device) -> *mut std::ffi::c_void {
+        unsafe {
+            let data: *mut std::ffi::c_void = device
+                .map_memory(self.memory, 0, size, vk::MemoryMapFlags::empty())
+                .unwrap();
+            data
+        }
+    }
+
+    fn unmap(&mut self, device: &ash::Device) {
+        unsafe {
+            device.unmap_memory(self.memory);
+        }
+    }
+    pub fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
 }
