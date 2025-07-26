@@ -1,15 +1,14 @@
-#![feature(gen_blocks)]
 use std::{collections::HashSet, error::Error, ffi::CStr, os::raw::c_char, path::PathBuf};
 
 use ash::{
-    khr::acceleration_structure,
     prelude::VkResult,
-    util::Align,
-    vk::{self, AccelerationStructureGeometryKHR, AccelerationStructureKHR, Packed24_8},
+    vk::{self, Packed24_8},
 };
 use bsp::Bsp;
 use clap::Parser;
 use lump_definitions::source::{Edge, Face, LumpDefinition, SurfaceEdge, Vertex};
+
+use radiosity::vulkan::{AccelerationStructure, ApplicationInfoExt, Buffer, VkContext};
 use radiosity::Associated;
 
 #[allow(dead_code)]
@@ -23,59 +22,6 @@ struct Args {
     /// Use high dynamic range lumps
     #[arg(long)]
     hdr: bool,
-}
-
-trait ApplicationInfoExt {
-    fn application_from_env(self) -> Self;
-}
-
-impl<'a> ApplicationInfoExt for vk::ApplicationInfo<'a> {
-    fn application_from_env(self) -> Self {
-        let application_name =
-            CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_NAME"), "\0").as_bytes())
-                .expect("invalid package name");
-
-        let major = env!("CARGO_PKG_VERSION_MAJOR")
-            .parse::<u32>()
-            .expect("invalid major version");
-        let minor = env!("CARGO_PKG_VERSION_MINOR")
-            .parse::<u32>()
-            .expect("invalid minor version");
-        let patch = env!("CARGO_PKG_VERSION_PATCH")
-            .parse::<u32>()
-            .expect("invalid patch version");
-
-        self.application_name(application_name)
-            .application_version(vk::make_api_version(0, major, minor, patch))
-    }
-}
-
-trait PhysicalDeviceMemoryPropertiesExt {
-    fn mem_ty_idx(
-        &self,
-        required_bits: u32,
-        required_properties: vk::MemoryPropertyFlags,
-    ) -> Option<u32>;
-}
-
-impl PhysicalDeviceMemoryPropertiesExt for vk::PhysicalDeviceMemoryProperties {
-    fn mem_ty_idx(
-        &self,
-        required_bits: u32,
-        required_properties: vk::MemoryPropertyFlags,
-    ) -> Option<u32> {
-        for idx in 0..self.memory_type_count {
-            let memory_properties = self.memory_types[idx as usize].property_flags;
-
-            if (required_bits & (1 << idx)) == 1
-                && (memory_properties & required_properties) == required_properties
-            {
-                return Some(idx);
-            }
-        }
-
-        None
-    }
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -165,7 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("Failed to create logical Device!")
     };
 
-    let graphics_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+    let device_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
     let command_pool = {
         let command_pool_create_info =
@@ -175,7 +121,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             .expect("Failed to create Command Pool!")
     };
 
-    let acceleration_structure = ash::khr::acceleration_structure::Device::new(&instance, &device);
+    let vk_ctx = VkContext::new(
+        &device,
+        &device_queue,
+        &command_pool,
+        &device_memory_properties,
+    )?;
+
+    let as_device = ash::khr::acceleration_structure::Device::new(&instance, &device);
 
     // ...
 
@@ -183,14 +136,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
         .expect("Failed to get vertices lump");
 
-    let mut vertex_buffer = BufferResource::new(
+    let mut vertex_buffer = Buffer::new(
+        &vk_ctx,
         (std::mem::size_of::<Vertex>() * vertices.len()) as u64,
         vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        &device,
-        device_memory_properties,
     )?;
     vertex_buffer.store(&vertices, &device);
 
@@ -250,14 +202,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .flatten()
         .collect::<Vec<_>>();
 
-    let mut index_buffer = BufferResource::new(
+    let mut index_buffer = Buffer::new(
+        &vk_ctx,
         (std::mem::size_of::<u16>() * indices.len()) as u64,
         vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        &device,
-        device_memory_properties,
     )?;
     index_buffer.store(&indices, &device);
 
@@ -278,17 +229,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .flags(vk::GeometryFlagsKHR::OPAQUE);
 
-    let blas = AccelerationStructureResource::new(
-        &[geometry],
-        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
+    let blas = AccelerationStructure::new(
+        &vk_ctx,
+        &as_device,
         vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-        vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .primitive_count(indices.len() as u32 / 3),
-        &acceleration_structure,
-        &device,
-        device_memory_properties,
-        &graphics_queue,
-        &command_pool,
+        &[geometry],
+        &[vk::AccelerationStructureBuildRangeInfoKHR::default()
+            .primitive_count(indices.len() as u32 / 3)],
+        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
     )?;
 
     let instance_buffer = {
@@ -302,19 +250,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
             ),
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: blas.device_address(&acceleration_structure),
+                device_handle: blas.device_address(&as_device),
             },
         }];
         let instance_buffer_size =
             std::mem::size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len();
 
-        let mut instance_buffer = BufferResource::new(
+        let mut instance_buffer = Buffer::new(
+            &vk_ctx,
             instance_buffer_size as vk::DeviceSize,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-            &device,
-            device_memory_properties,
         )?;
 
         instance_buffer.store(&instances, &device);
@@ -332,24 +279,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         .geometry_type(vk::GeometryTypeKHR::INSTANCES)
         .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
 
-    let tlas = AccelerationStructureResource::new(
-        &[geometry],
-        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
+    let tlas = AccelerationStructure::new(
+        &vk_ctx,
+        &as_device,
         vk::AccelerationStructureTypeKHR::TOP_LEVEL,
-        vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1),
-        &acceleration_structure,
-        &device,
-        device_memory_properties,
-        &graphics_queue,
-        &command_pool,
+        &[geometry],
+        &[vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1)],
+        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
     )?;
 
     unsafe {
         device.destroy_command_pool(command_pool, None);
     }
 
-    blas.destroy(&acceleration_structure, &device);
-    tlas.destroy(&acceleration_structure, &device);
+    blas.destroy(&as_device, &device);
+    tlas.destroy(&as_device, &device);
 
     instance_buffer.destroy(&device);
     vertex_buffer.destroy(&device);
@@ -386,219 +330,4 @@ fn find_physical_device(
         });
 
     Ok(device)
-}
-
-struct BufferResource {
-    buffer: vk::Buffer,
-    memory: vk::DeviceMemory,
-}
-
-impl BufferResource {
-    pub fn new(
-        size: vk::DeviceSize,
-        usage: vk::BufferUsageFlags,
-        memory_properties: vk::MemoryPropertyFlags,
-        device: &ash::Device,
-        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    ) -> VkResult<Self> {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let buffer = unsafe { device.create_buffer(&buffer_info, None) }?;
-
-        let memory_req = unsafe { device.get_buffer_memory_requirements(buffer) };
-
-        let memory_index = device_memory_properties
-            .mem_ty_idx(memory_req.memory_type_bits, memory_properties)
-            .expect("Failed to get memory type");
-
-        let mut allocate_info_builder = vk::MemoryAllocateInfo::default();
-
-        let mut memory_allocate_flags_info =
-            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-
-        if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
-            allocate_info_builder =
-                allocate_info_builder.push_next(&mut memory_allocate_flags_info);
-        }
-
-        let allocate_info = allocate_info_builder
-            .allocation_size(memory_req.size)
-            .memory_type_index(memory_index);
-
-        let memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
-
-        unsafe { device.bind_buffer_memory(buffer, memory, 0) }?;
-
-        Ok(Self { buffer, memory })
-    }
-
-    fn device_address(&self, device: &ash::Device) -> u64 {
-        unsafe {
-            device.get_buffer_device_address(
-                &vk::BufferDeviceAddressInfo::default().buffer(self.buffer),
-            )
-        }
-    }
-
-    fn store<T: Copy>(&mut self, data: &[T], device: &ash::Device) {
-        unsafe {
-            let size = std::mem::size_of_val(data) as u64;
-            let mapped_ptr = self.map(size, device);
-            let mut mapped_slice = Align::new(mapped_ptr, std::mem::align_of::<T>() as u64, size);
-            mapped_slice.copy_from_slice(data);
-            self.unmap(device);
-        }
-    }
-
-    fn map(&mut self, size: vk::DeviceSize, device: &ash::Device) -> *mut std::ffi::c_void {
-        unsafe {
-            let data: *mut std::ffi::c_void = device
-                .map_memory(self.memory, 0, size, vk::MemoryMapFlags::empty())
-                .unwrap();
-            data
-        }
-    }
-
-    fn unmap(&mut self, device: &ash::Device) {
-        unsafe {
-            device.unmap_memory(self.memory);
-        }
-    }
-    pub fn destroy(self, device: &ash::Device) {
-        unsafe {
-            device.destroy_buffer(self.buffer, None);
-            device.free_memory(self.memory, None);
-        }
-    }
-}
-
-struct AccelerationStructureResource {
-    buffer: BufferResource,
-    as_structure: AccelerationStructureKHR,
-}
-
-impl AccelerationStructureResource {
-    pub fn new<'a>(
-        geometries: &'a [AccelerationStructureGeometryKHR<'a>],
-        flags: vk::BuildAccelerationStructureFlagsKHR,
-        ty: vk::AccelerationStructureTypeKHR,
-        build_range_info: vk::AccelerationStructureBuildRangeInfoKHR,
-        as_device: &acceleration_structure::Device,
-        device: &ash::Device,
-        device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-        &queue: &vk::Queue,
-        &command_pool: &vk::CommandPool,
-    ) -> VkResult<Self> {
-        let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
-            .flags(flags)
-            .geometries(geometries)
-            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
-            .ty(ty);
-
-        let mut sizes_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
-        unsafe {
-            as_device.get_acceleration_structure_build_sizes(
-                vk::AccelerationStructureBuildTypeKHR::DEVICE,
-                &build_info,
-                &[build_range_info.primitive_count],
-                &mut sizes_info,
-            )
-        };
-
-        let buffer = BufferResource::new(
-            sizes_info.acceleration_structure_size,
-            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            device,
-            device_memory_properties,
-        )?;
-
-        let create_info = vk::AccelerationStructureCreateInfoKHR::default()
-            .ty(build_info.ty)
-            .size(sizes_info.acceleration_structure_size)
-            .buffer(buffer.buffer)
-            .offset(0);
-
-        let as_structure = unsafe { as_device.create_acceleration_structure(&create_info, None) }?;
-        build_info.dst_acceleration_structure = as_structure;
-
-        let scratch_buffer = BufferResource::new(
-            sizes_info.acceleration_structure_size,
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
-            vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            device,
-            device_memory_properties,
-        )?;
-
-        build_info.scratch_data = vk::DeviceOrHostAddressKHR {
-            device_address: scratch_buffer.device_address(device),
-        };
-
-        let build_command_buffer = {
-            let allocate_info = vk::CommandBufferAllocateInfo::default()
-                .command_buffer_count(1)
-                .command_pool(command_pool)
-                .level(vk::CommandBufferLevel::PRIMARY);
-
-            let command_buffers =
-                unsafe { device.allocate_command_buffers(&allocate_info) }.unwrap();
-            command_buffers[0]
-        };
-
-        unsafe {
-            device
-                .begin_command_buffer(
-                    build_command_buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .unwrap();
-
-            as_device.cmd_build_acceleration_structures(
-                build_command_buffer,
-                &[build_info],
-                &[&[build_range_info]],
-            );
-            device.end_command_buffer(build_command_buffer).unwrap();
-            device
-                .queue_submit(
-                    queue,
-                    &[vk::SubmitInfo::default().command_buffers(&[build_command_buffer])],
-                    vk::Fence::null(),
-                )?;
-
-            device.queue_wait_idle(queue).unwrap();
-            device.free_command_buffers(command_pool, &[build_command_buffer]);
-            scratch_buffer.destroy(device);
-        }
-
-        Ok(Self {
-            buffer,
-            as_structure,
-        })
-    }
-
-    // pub fn update(&self) {
-    //     todo!()
-    // }
-
-    pub fn device_address(&self, as_device: &acceleration_structure::Device) -> u64 {
-        unsafe {
-            as_device.get_acceleration_structure_device_address(
-                &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                    .acceleration_structure(self.as_structure),
-            )
-        }
-    }
-
-    pub fn destroy(self, as_device: &acceleration_structure::Device, device: &ash::Device) {
-        unsafe {
-            as_device.destroy_acceleration_structure(self.as_structure, None);
-            self.buffer.destroy(device);
-        }
-    }
 }
