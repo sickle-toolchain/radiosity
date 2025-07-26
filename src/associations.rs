@@ -38,7 +38,7 @@ macro_rules! association {
 
     // Rule for [|a|]
     (@expression $self:ident, $lump:ident, [|$field:ident|]) => {
-        $lump[$self.$field.abs() as usize]
+        $lump[$self.$field.unsigned_abs() as usize]
     };
 
     // Rule for [a..b]
