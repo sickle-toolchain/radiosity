@@ -3,7 +3,7 @@
 #![cfg_attr(target_arch = "spirv", no_std)]
 
 use spirv_std::{
-    glam::{uvec2, vec2, vec3, UVec3, Vec2, Vec3},
+    glam::{UVec3, Vec2, Vec3, uvec2, vec2, vec3},
     image::Image,
     ray_tracing::{AccelerationStructure, RayFlags},
     spirv,
