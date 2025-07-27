@@ -35,7 +35,7 @@ pub trait ApplicationInfoExt {
     fn application_from_env(self) -> Self;
 }
 
-impl<'a> ApplicationInfoExt for vk::ApplicationInfo<'a> {
+impl ApplicationInfoExt for vk::ApplicationInfo<'_> {
     fn application_from_env(self) -> Self {
         let application_name =
             CStr::from_bytes_with_nul(concat!(env!("CARGO_PKG_NAME"), "\0").as_bytes())
