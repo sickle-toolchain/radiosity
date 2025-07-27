@@ -40,7 +40,7 @@ impl AccelerationStructure {
                     .collect::<Vec<_>>()
                     .as_slice(),
                 &mut sizes_info,
-            )
+            );
         };
 
         let buffer = Buffer::new(
@@ -110,6 +110,10 @@ impl AccelerationStructure {
         }
 
         Ok(Self { inner, buffer })
+    }
+
+    pub fn handle(&self) -> vk::AccelerationStructureKHR {
+        self.inner
     }
 
     pub fn device_address(&self, as_device: &ash::khr::acceleration_structure::Device) -> u64 {
