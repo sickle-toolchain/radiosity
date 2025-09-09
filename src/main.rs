@@ -167,7 +167,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 I: Iterator<Item = A>,
             {
                 iter: I,
-                v0: Option<A>,
+                pivot: Option<A>,
                 prev: Option<A>,
             }
 
@@ -176,9 +176,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 I: Iterator<Item = A>,
             {
                 fn new(mut iter: I) -> Self {
-                    let v0 = iter.next();
+                    let pivot = iter.next();
                     let prev = iter.next();
-                    FanTriangulation { iter, v0, prev }
+                    FanTriangulation { iter, pivot, prev }
                 }
             }
 
@@ -189,8 +189,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 type Item = [A; 3];
 
                 fn next(&mut self) -> Option<Self::Item> {
-                    if let Some(current) = self.iter.next() {
-                        let triangle = [self.v0.unwrap(), self.prev.unwrap(), current];
+                    if let (Some(pivot), Some(prev), Some(current)) =
+                        (self.pivot, self.prev, self.iter.next())
+                    {
+                        let triangle = [pivot, prev, current];
                         self.prev = Some(current);
                         Some(triangle)
                     } else {
