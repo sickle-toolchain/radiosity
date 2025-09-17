@@ -158,7 +158,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default();
         unsafe {
-            (instance.fp_v1_1().get_physical_device_features2)(physical_device, &raw mut features2);
+            instance.get_physical_device_features2(physical_device, &mut features2);
         };
 
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
