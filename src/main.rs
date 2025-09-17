@@ -315,7 +315,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .flags(vk::GeometryFlagsKHR::OPAQUE);
 
-    let blas = AccelerationStructure::new(
+    let blas = AccelerationStructure::build(
         &vk_ctx,
         &as_device,
         vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
@@ -365,7 +365,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .geometry_type(vk::GeometryTypeKHR::INSTANCES)
         .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
 
-    let tlas = AccelerationStructure::new(
+    let tlas = AccelerationStructure::build(
         &vk_ctx,
         &as_device,
         vk::AccelerationStructureTypeKHR::TOP_LEVEL,
