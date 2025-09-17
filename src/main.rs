@@ -229,7 +229,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    vertex_buffer.store(&vertices, &device);
+    vertex_buffer.store(&vertices);
 
     let faces = bsp
         .lump_cast::<[Face], _>(LumpDefinition::Faces)
@@ -296,20 +296,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    index_buffer.store(&indices, &device);
+    index_buffer.store(&indices);
 
     let geometry = vk::AccelerationStructureGeometryKHR::default()
         .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
         .geometry(vk::AccelerationStructureGeometryDataKHR {
             triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
                 .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: vertex_buffer.device_address(&device),
+                    device_address: vertex_buffer.device_address(),
                 })
                 .max_vertex(vertices.len() as u32 - 1)
                 .vertex_stride(std::mem::size_of::<[f32; 3]>() as u64)
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
                 .index_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: index_buffer.device_address(&device),
+                    device_address: index_buffer.device_address(),
                 })
                 .index_type(vk::IndexType::UINT16),
         })
@@ -336,7 +336,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
             ),
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: blas.device_address(&as_device),
+                device_handle: blas.device_address(),
             },
         }];
         let instance_buffer_size =
@@ -350,7 +350,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        instance_buffer.store(&instances, &device);
+        instance_buffer.store(&instances);
 
         instance_buffer
     };
@@ -358,7 +358,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let instances = vk::AccelerationStructureGeometryInstancesDataKHR::default()
         .array_of_pointers(false)
         .data(vk::DeviceOrHostAddressConstKHR {
-            device_address: instance_buffer.device_address(&device),
+            device_address: instance_buffer.device_address(),
         });
 
     let geometry = vk::AccelerationStructureGeometryKHR::default()
@@ -536,7 +536,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             vk::MemoryPropertyFlags::HOST_VISIBLE,
         )?;
 
-        shader_binding_table_buffer.store(&table_data, &device);
+        shader_binding_table_buffer.store(&table_data);
 
         shader_binding_table_buffer
     };
@@ -587,7 +587,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // |                 |               |               |
         // | 0               | 1             | 2             | 3
 
-        let sbt_address = shader_binding_table_buffer.device_address(&device);
+        let sbt_address = shader_binding_table_buffer.device_address();
 
         let sbt_raygen_region = vk::StridedDeviceAddressRegionKHR::default()
             .device_address(sbt_address)
@@ -653,7 +653,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     unsafe {
         device.destroy_descriptor_pool(descriptor_pool, None);
-        shader_binding_table_buffer.destroy(&device);
+        shader_binding_table_buffer.destroy();
         device.destroy_pipeline(graphics_pipeline, None);
         device.destroy_descriptor_set_layout(descriptor_set_layout, None);
     }
@@ -662,12 +662,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         device.destroy_pipeline_layout(pipeline_layout, None);
     }
 
-    blas.destroy(&as_device, &device);
-    tlas.destroy(&as_device, &device);
+    blas.destroy();
+    tlas.destroy();
 
-    instance_buffer.destroy(&device);
-    vertex_buffer.destroy(&device);
-    index_buffer.destroy(&device);
+    instance_buffer.destroy();
+    vertex_buffer.destroy();
+    index_buffer.destroy();
 
     unsafe {
         device.destroy_device(None);

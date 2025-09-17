@@ -3,20 +3,21 @@ use std::ffi::c_void;
 use crate::vulkan::VkContext;
 
 use super::PhysicalDeviceMemoryPropertiesExt;
-use ash::{prelude::VkResult, util::Align, vk};
+use ash::{prelude::VkResult, util::Align, vk, Device};
 
-pub struct Buffer {
+pub struct Buffer<'a> {
+    pub(crate) device: &'a Device,
     pub(crate) inner: vk::Buffer,
     pub(crate) device_memory: vk::DeviceMemory,
 }
 
-impl Buffer {
+impl<'a> Buffer<'a> {
     pub fn new(
         VkContext {
             device,
             device_memory_properties,
             ..
-        }: &VkContext<'_>,
+        }: &'a VkContext<'_>,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         memory_properties: vk::MemoryPropertyFlags,
@@ -53,6 +54,7 @@ impl Buffer {
 
         Ok(Self {
             inner,
+            device,
             device_memory,
         })
     }
@@ -61,40 +63,41 @@ impl Buffer {
         self.inner
     }
 
-    pub fn device_address(&self, device: &ash::Device) -> u64 {
+    pub fn device_address(&self) -> u64 {
         let address_info = vk::BufferDeviceAddressInfo::default().buffer(self.inner);
-        unsafe { device.get_buffer_device_address(&address_info) }
+        unsafe { self.device.get_buffer_device_address(&address_info) }
     }
 
-    pub fn store<T: Copy>(&mut self, data: &[T], device: &ash::Device) {
+    pub fn store<T: Copy>(&mut self, data: &[T]) {
         unsafe {
             let size = std::mem::size_of_val(data) as u64;
-            let mapped_ptr = self.map(size, device);
+            let mapped_ptr = self.map(size);
             let mut mapped_slice = Align::new(mapped_ptr, std::mem::align_of::<T>() as u64, size);
             mapped_slice.copy_from_slice(data);
-            self.unmap(device);
+            self.unmap();
         }
     }
 
-    fn map(&mut self, size: vk::DeviceSize, device: &ash::Device) -> *mut c_void {
+    fn map(&mut self, size: vk::DeviceSize) -> *mut c_void {
         unsafe {
-            let data: *mut std::ffi::c_void = device
+            let data: *mut std::ffi::c_void = self
+                .device
                 .map_memory(self.device_memory, 0, size, vk::MemoryMapFlags::empty())
                 .unwrap();
             data
         }
     }
 
-    fn unmap(&mut self, device: &ash::Device) {
+    fn unmap(&mut self) {
         unsafe {
-            device.unmap_memory(self.device_memory);
+            self.device.unmap_memory(self.device_memory);
         }
     }
 
-    pub fn destroy(self, device: &ash::Device) {
+    pub fn destroy(self) {
         unsafe {
-            device.destroy_buffer(self.inner, None);
-            device.free_memory(self.device_memory, None);
+            self.device.destroy_buffer(self.inner, None);
+            self.device.free_memory(self.device_memory, None);
         }
     }
 }

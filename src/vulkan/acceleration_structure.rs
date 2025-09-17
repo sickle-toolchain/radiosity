@@ -1,23 +1,24 @@
-use ash::{prelude::VkResult, vk};
+use ash::{khr::acceleration_structure, prelude::VkResult, vk};
 
 use crate::vulkan::VkContext;
 
 use super::Buffer;
 
-pub struct AccelerationStructure {
+pub struct AccelerationStructure<'a> {
+    pub(crate) device: &'a acceleration_structure::Device,
     pub(crate) inner: vk::AccelerationStructureKHR,
-    buffer: Buffer,
+    buffer: Buffer<'a>,
 }
 
-impl AccelerationStructure {
+impl<'a> AccelerationStructure<'a> {
     pub fn new(
         vk_ctx @ &VkContext {
             device,
             queue,
             command_pool,
             ..
-        }: &VkContext<'_>,
-        as_device: &ash::khr::acceleration_structure::Device,
+        }: &'a VkContext<'_>,
+        as_device: &'a acceleration_structure::Device,
         ty: vk::AccelerationStructureTypeKHR,
         geometries: &[vk::AccelerationStructureGeometryKHR],
         ranges: &[vk::AccelerationStructureBuildRangeInfoKHR],
@@ -69,7 +70,7 @@ impl AccelerationStructure {
         )?;
 
         build_info.scratch_data = vk::DeviceOrHostAddressKHR {
-            device_address: scratch_buffer.device_address(device),
+            device_address: scratch_buffer.device_address(),
         };
 
         let build_command_buffer = {
@@ -106,33 +107,33 @@ impl AccelerationStructure {
 
             device.queue_wait_idle(*queue).unwrap();
             device.free_command_buffers(*command_pool, &[build_command_buffer]);
-            scratch_buffer.destroy(device);
+            scratch_buffer.destroy();
         }
 
-        Ok(Self { inner, buffer })
+        Ok(Self {
+            device: as_device,
+            inner,
+            buffer,
+        })
     }
 
     pub fn handle(&self) -> vk::AccelerationStructureKHR {
         self.inner
     }
 
-    pub fn device_address(&self, as_device: &ash::khr::acceleration_structure::Device) -> u64 {
+    pub fn device_address(&self) -> u64 {
         unsafe {
-            as_device.get_acceleration_structure_device_address(
+            self.device.get_acceleration_structure_device_address(
                 &vk::AccelerationStructureDeviceAddressInfoKHR::default()
                     .acceleration_structure(self.inner),
             )
         }
     }
 
-    pub fn destroy(
-        self,
-        as_device: &ash::khr::acceleration_structure::Device,
-        device: &ash::Device,
-    ) {
+    pub fn destroy(self) {
         unsafe {
-            as_device.destroy_acceleration_structure(self.inner, None);
-            self.buffer.destroy(device);
+            self.device.destroy_acceleration_structure(self.inner, None);
+            self.buffer.destroy();
         }
     }
 }
