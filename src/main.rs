@@ -1,11 +1,25 @@
-use std::{collections::HashSet, error::Error, ffi::CStr, os::raw::c_char, path::PathBuf, ptr};
+use std::{
+    collections::HashSet,
+    error::Error,
+    ffi::{c_void, CStr},
+    os::raw::c_char,
+    path::PathBuf,
+    ptr,
+};
 
 use ash::{
+    ext::{debug_utils, scalar_block_layout},
+    khr::{
+        acceleration_structure, deferred_host_operations, get_memory_requirements2,
+        ray_tracing_pipeline, spirv_1_4,
+    },
     prelude::VkResult,
     vk::{self, Packed24_8},
+    Device, Entry, Instance,
 };
 use bsp::Bsp;
 use clap::Parser;
+use log::{log, warn, Level};
 use lump_definitions::source::{Edge, Face, LumpDefinition, SurfaceEdge, Vertex};
 
 use radiosity::vulkan::{AccelerationStructure, ApplicationInfoExt, Buffer, VkContext};
@@ -24,35 +38,102 @@ struct Args {
     hdr: bool,
 }
 
+pub extern "system" fn vulkan_debug_utils_callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _p_user_data: *mut c_void,
+) -> vk::Bool32 {
+    let level = match message_severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => Level::Debug,
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => Level::Warn,
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => Level::Error,
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => Level::Info,
+        _ => unreachable!(),
+    };
+
+    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) };
+
+    log!(
+        target: "vulkan",
+        level,
+        "{}", message.to_string_lossy()
+    );
+
+    vk::FALSE
+}
+
+pub const KHR_VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
+
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
+
     let args = Args::parse();
 
     let contents = std::fs::read(args.bsp_path)?;
     let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
 
-    let entry = unsafe { ash::Entry::load() }?;
+    let entry = unsafe { Entry::load() }?;
+
+    let instance_layer_properties = unsafe { entry.enumerate_instance_layer_properties() }?;
+    let instance_layers: Vec<&CStr> = instance_layer_properties
+        .iter()
+        .filter_map(|p| p.layer_name_as_c_str().ok())
+        .collect();
 
     let instance = {
         let application_info = vk::ApplicationInfo::default()
             .application_from_env()
             .api_version(vk::API_VERSION_1_2);
 
-        let instance_create_info =
-            vk::InstanceCreateInfo::default().application_info(&application_info);
+        let mut enabled_layer_names = vec![];
+        let enabled_extension_names = vec![debug_utils::NAME.as_ptr()];
+
+        if instance_layers.contains(&KHR_VALIDATION_LAYER) {
+            enabled_layer_names.push(KHR_VALIDATION_LAYER.as_ptr());
+        } else {
+            warn!(
+                "Layer '{}' is not suppported",
+                KHR_VALIDATION_LAYER.to_string_lossy()
+            );
+            warn!("Running without validation layer")
+        }
+
+        let mut debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+            )
+            .pfn_user_callback(Some(vulkan_debug_utils_callback));
+
+        let instance_create_info = vk::InstanceCreateInfo::default()
+            .application_info(&application_info)
+            .enabled_layer_names(&enabled_layer_names.as_slice())
+            .enabled_extension_names(&enabled_extension_names.as_slice())
+            .push_next(&mut debug_utils_create_info);
 
         unsafe { entry.create_instance(&instance_create_info, None) }
-            .expect("failed to create instance!")
+            .expect("Failed to create instance")
     };
 
-    let physical_device = find_physical_device(
-        &instance,
-        &[
-            ash::khr::acceleration_structure::NAME,
-            ash::khr::deferred_host_operations::NAME,
-            ash::khr::ray_tracing_pipeline::NAME,
-        ],
-    )?
-    .expect("Failed to find physical device");
+    let required_extensions: &[&CStr] = &[
+        acceleration_structure::NAME,
+        deferred_host_operations::NAME,
+        ray_tracing_pipeline::NAME,
+        spirv_1_4::NAME,
+        scalar_block_layout::NAME,
+        get_memory_requirements2::NAME,
+    ];
+
+    let physical_device = find_physical_device(&instance, required_extensions)?
+        .expect("Failed to find physical device");
 
     let queue_family_index =
         unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
@@ -70,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let device_memory_properties =
         unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-    let device: ash::Device = {
+    let device: Device = {
         let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family_index)
             .queue_priorities(&[1.0])];
@@ -90,22 +171,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut raytracing_pipeline =
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
-        let enabled_extension_names = [
-            ash::khr::acceleration_structure::NAME.as_ptr(),
-            ash::khr::deferred_host_operations::NAME.as_ptr(),
-            ash::khr::ray_tracing_pipeline::NAME.as_ptr(),
-            vk::KHR_SPIRV_1_4_NAME.as_ptr(),
-            vk::EXT_SCALAR_BLOCK_LAYOUT_NAME.as_ptr(),
-            vk::KHR_GET_MEMORY_REQUIREMENTS2_NAME.as_ptr(),
-        ];
-
+        let enabled_extension_names = required_extensions
+            .iter()
+            .map(|c| c.as_ptr())
+            .collect::<Vec<_>>();
         let device_create_info = vk::DeviceCreateInfo::default()
             .push_next(&mut features2)
             .push_next(&mut features12)
             .push_next(&mut as_feature)
             .push_next(&mut raytracing_pipeline)
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&enabled_extension_names);
+            .enabled_extension_names(&enabled_extension_names.as_slice());
 
         unsafe { instance.create_device(physical_device, &device_create_info, None) }
             .expect("Failed to create logical Device!")
@@ -128,8 +204,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         &device_memory_properties,
     )?;
 
-    let as_device = ash::khr::acceleration_structure::Device::new(&instance, &device);
-    let rt_pipeline_device = ash::khr::ray_tracing_pipeline::Device::new(&instance, &device);
+    let as_device = acceleration_structure::Device::new(&instance, &device);
+    let rt_pipeline_device = ray_tracing_pipeline::Device::new(&instance, &device);
     let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
     {
         let mut physical_device_properties2 =
@@ -605,7 +681,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn find_physical_device(
-    instance: &ash::Instance,
+    instance: &Instance,
     required_extensions: &[&CStr],
 ) -> VkResult<Option<vk::PhysicalDevice>> {
     let device = unsafe { instance.enumerate_physical_devices() }?
