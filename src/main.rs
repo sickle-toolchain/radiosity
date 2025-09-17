@@ -38,7 +38,7 @@ struct Args {
     hdr: bool,
 }
 
-pub extern "system" fn vulkan_debug_utils_callback(
+pub unsafe extern "system" fn vulkan_debug_utils_callback(
     message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
     _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
