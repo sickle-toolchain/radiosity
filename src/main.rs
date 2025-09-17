@@ -115,8 +115,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
         let instance_create_info = vk::InstanceCreateInfo::default()
             .application_info(&application_info)
-            .enabled_layer_names(&enabled_layer_names.as_slice())
-            .enabled_extension_names(&enabled_extension_names.as_slice())
+            .enabled_layer_names(enabled_layer_names.as_slice())
+            .enabled_extension_names(enabled_extension_names.as_slice())
             .push_next(&mut debug_utils_create_info);
 
         unsafe { entry.create_instance(&instance_create_info, None) }
@@ -181,7 +181,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             .push_next(&mut as_feature)
             .push_next(&mut raytracing_pipeline)
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&enabled_extension_names.as_slice());
+            .enabled_extension_names(enabled_extension_names.as_slice());
 
         unsafe { instance.create_device(physical_device, &device_create_info, None) }
             .expect("Failed to create logical Device!")
