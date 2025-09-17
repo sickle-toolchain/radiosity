@@ -11,7 +11,7 @@ pub struct AccelerationStructure<'a> {
 }
 
 impl<'a> AccelerationStructure<'a> {
-    pub fn new(
+    pub fn build(
         vk_ctx @ &VkContext {
             device,
             queue,
