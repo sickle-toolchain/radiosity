@@ -1,12 +1,13 @@
 use std::{
+    borrow::Cow,
     collections::HashSet,
-    error::Error,
     ffi::{c_void, CStr},
     os::raw::c_char,
     path::PathBuf,
     ptr,
 };
 
+use anyhow::{bail, Context, Result};
 use ash::{
     ext::{debug_utils, scalar_block_layout},
     khr::{
@@ -14,12 +15,12 @@ use ash::{
         ray_tracing_pipeline, spirv_1_4,
     },
     prelude::VkResult,
-    vk::{self, Packed24_8},
+    vk::{self, Packed24_8, PhysicalDevice},
     Device, Entry, Instance,
 };
 use bsp::Bsp;
 use clap::Parser;
-use log::{log, warn, Level};
+use log::{error, info, log, Level};
 use lump_definitions::source::{Edge, Face, LumpDefinition, SurfaceEdge, Vertex};
 
 use radiosity::vulkan::{AccelerationStructure, ApplicationInfoExt, Buffer, VkContext};
@@ -29,13 +30,22 @@ use radiosity::Associated;
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
 
 #[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
 struct Args {
     /// Path to BSP file
     bsp_path: PathBuf,
 
     /// Use high dynamic range lumps
-    #[arg(long)]
+    #[arg(help_heading = "bsp", long)]
     hdr: bool,
+
+    /// Enable kronos validation layer if available
+    #[arg(help_heading = "vulkan", long)]
+    validation_layer: bool,
+
+    /// Force use of specific device id
+    #[arg(help_heading = "vulkan", long)]
+    device_id: Option<u32>,
 }
 
 pub unsafe extern "system" fn vulkan_debug_utils_callback(
@@ -63,42 +73,25 @@ pub unsafe extern "system" fn vulkan_debug_utils_callback(
     vk::FALSE
 }
 
-pub const KHR_VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
-
-fn main() -> Result<(), Box<dyn Error>> {
-    env_logger::init();
-
-    let args = Args::parse();
-
-    let contents = std::fs::read(args.bsp_path)?;
-    let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
-
-    let entry = unsafe { Entry::load() }?;
-
+fn create_vk_instance(entry: &Entry, layers: Vec<&CStr>) -> Result<Instance> {
     let instance_layer_properties = unsafe { entry.enumerate_instance_layer_properties() }?;
     let instance_layers: Vec<&CStr> = instance_layer_properties
         .iter()
         .filter_map(|p| p.layer_name_as_c_str().ok())
         .collect();
 
+    for layer in &layers {
+        if !instance_layers.contains(layer) {
+            bail!("Layer '{}' is not suppported", layer.to_string_lossy());
+        }
+    }
+
     let instance = {
         let application_info = vk::ApplicationInfo::default()
             .application_from_env()
             .api_version(vk::API_VERSION_1_2);
 
-        let mut enabled_layer_names = vec![];
         let enabled_extension_names = vec![debug_utils::NAME.as_ptr()];
-
-        if instance_layers.contains(&KHR_VALIDATION_LAYER) {
-            enabled_layer_names.push(KHR_VALIDATION_LAYER.as_ptr());
-        } else {
-            warn!(
-                "Layer '{}' is not suppported",
-                KHR_VALIDATION_LAYER.to_string_lossy()
-            );
-            warn!("Running without validation layer")
-        }
-
         let mut debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
             .message_severity(
                 vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
@@ -113,6 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             )
             .pfn_user_callback(Some(vulkan_debug_utils_callback));
 
+        let enabled_layer_names = layers.iter().map(|l| l.as_ptr()).collect::<Vec<_>>();
+
         let instance_create_info = vk::InstanceCreateInfo::default()
             .application_info(&application_info)
             .enabled_layer_names(enabled_layer_names.as_slice())
@@ -120,10 +115,96 @@ fn main() -> Result<(), Box<dyn Error>> {
             .push_next(&mut debug_utils_create_info);
 
         unsafe { entry.create_instance(&instance_create_info, None) }
-            .expect("Failed to create instance")
+            .context("Failed to create instance")?
     };
 
-    let required_extensions: &[&CStr] = &[
+    Ok(instance)
+}
+
+pub trait PhysicalDeviceExt {
+    fn find_queue_family_idx(
+        &self,
+        instance: &Instance,
+        pred: fn(&vk::QueueFamilyProperties) -> bool,
+    ) -> Option<u32>;
+}
+
+impl PhysicalDeviceExt for PhysicalDevice {
+    fn find_queue_family_idx(
+        &self,
+        instance: &Instance,
+        pred: fn(&vk::QueueFamilyProperties) -> bool,
+    ) -> Option<u32> {
+        unsafe { instance.get_physical_device_queue_family_properties(*self) }
+            .into_iter()
+            .enumerate()
+            .find(|(_, device_properties)| pred(device_properties))
+            .map(|(idx, _)| idx as u32)
+    }
+}
+
+pub trait InstanceExt {
+    fn physical_device_by_id(&self, id: u32) -> VkResult<Option<PhysicalDevice>>;
+    fn find_physical_device(
+        &self,
+        required_extensions: &[&CStr],
+    ) -> VkResult<Option<PhysicalDevice>>;
+}
+
+impl InstanceExt for Instance {
+    fn physical_device_by_id(&self, id: u32) -> VkResult<Option<PhysicalDevice>> {
+        let device = unsafe { self.enumerate_physical_devices()? }
+            .iter()
+            .find(|&&physical_device| {
+                let props = unsafe { self.get_physical_device_properties(physical_device) };
+                props.device_id == id
+            })
+            .copied();
+
+        Ok(device)
+    }
+
+    fn find_physical_device(
+        &self,
+        required_extensions: &[&CStr],
+    ) -> VkResult<Option<PhysicalDevice>> {
+        let device = unsafe { self.enumerate_physical_devices() }?
+            .into_iter()
+            .find(|&physical_device| {
+                unsafe { self.enumerate_device_extension_properties(physical_device) }
+                    .map(|exts| {
+                        let set: HashSet<&CStr> = exts
+                            .iter()
+                            .map(|ext| unsafe {
+                                CStr::from_ptr(&ext.extension_name as *const c_char)
+                            })
+                            .collect();
+
+                        required_extensions.iter().all(|ext| set.contains(ext))
+                    })
+                    .unwrap_or(false)
+            });
+
+        Ok(device)
+    }
+}
+
+fn run() -> Result<()> {
+    let args = Args::parse();
+
+    let contents = std::fs::read(args.bsp_path)?;
+    let bsp = Bsp::parse(&contents).expect("failed to parse BSP file");
+
+    // NOTE: we can't call any vulkan functions after this is dropped.
+    let entry = unsafe { Entry::load() }?;
+
+    let mut instance_layers = vec![];
+    if args.validation_layer {
+        instance_layers.push(c"VK_LAYER_KHRONOS_validation")
+    }
+
+    let instance = create_vk_instance(&entry, instance_layers)?;
+    let extensions = &[
         acceleration_structure::NAME,
         deferred_host_operations::NAME,
         ray_tracing_pipeline::NAME,
@@ -132,28 +213,33 @@ fn main() -> Result<(), Box<dyn Error>> {
         get_memory_requirements2::NAME,
     ];
 
-    let physical_device = find_physical_device(&instance, required_extensions)?
-        .expect("Failed to find physical device");
+    let physical_device = if let Some(id) = args.device_id {
+        instance.physical_device_by_id(id)?
+    } else {
+        instance.find_physical_device(extensions)?
+    }
+    .context("Failed to find physical device")?;
 
-    let queue_family_index =
-        unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
-            .into_iter()
-            .enumerate()
-            .find(|(_, device_properties)| {
-                device_properties.queue_count > 0
-                    && device_properties
-                        .queue_flags
-                        .contains(vk::QueueFlags::GRAPHICS)
-            })
-            .map(|(idx, _)| idx as u32)
-            .expect("Failed to find queue family index");
+    let physical_device_properties =
+        unsafe { instance.get_physical_device_properties(physical_device) };
+    info!(
+        "Selected device '{}' ({})",
+        physical_device_properties
+            .device_name_as_c_str()
+            .map(CStr::to_string_lossy)
+            .unwrap_or(Cow::Borrowed("unknown")),
+        physical_device_properties.device_id
+    );
 
-    let device_memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
+    let queue_family_idx = physical_device
+        .find_queue_family_idx(&instance, |prop| {
+            prop.queue_count > 0 && prop.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+        })
+        .context("Failed to find queue family index")?;
 
     let device: Device = {
         let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_index)
+            .queue_family_index(queue_family_idx)
             .queue_priorities(&[1.0])];
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default();
@@ -165,37 +251,39 @@ fn main() -> Result<(), Box<dyn Error>> {
             .buffer_device_address(true)
             .vulkan_memory_model(true);
 
-        let mut as_feature = vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-            .acceleration_structure(true);
+        let mut acceleration_structure_features =
+            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(true);
 
-        let mut raytracing_pipeline =
+        let mut raytracing_pipeline_features =
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
-        let enabled_extension_names = required_extensions
-            .iter()
-            .map(|c| c.as_ptr())
-            .collect::<Vec<_>>();
+        let enabled_extension_names = extensions.iter().map(|c| c.as_ptr()).collect::<Vec<_>>();
+
         let device_create_info = vk::DeviceCreateInfo::default()
             .push_next(&mut features2)
             .push_next(&mut features12)
-            .push_next(&mut as_feature)
-            .push_next(&mut raytracing_pipeline)
+            .push_next(&mut acceleration_structure_features)
+            .push_next(&mut raytracing_pipeline_features)
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(enabled_extension_names.as_slice());
 
         unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .expect("Failed to create logical Device!")
+            .context("Failed to create device")?
     };
 
-    let device_queue = unsafe { device.get_device_queue(queue_family_index, 0) };
+    let device_queue = unsafe { device.get_device_queue(queue_family_idx, 0) };
 
     let command_pool = {
         let command_pool_create_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_idx);
 
         unsafe { device.create_command_pool(&command_pool_create_info, None) }
-            .expect("Failed to create Command Pool!")
+            .context("Failed to create command pool")?
     };
+
+    let device_memory_properties =
+        unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
     let vk_ctx = VkContext::new(
         &device,
@@ -679,25 +767,16 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     Ok(())
 }
+fn main() -> Result<()> {
+    env_logger::builder()
+        .filter_level(log::LevelFilter::Info)
+        .format_timestamp(None)
+        .init();
 
-fn find_physical_device(
-    instance: &Instance,
-    required_extensions: &[&CStr],
-) -> VkResult<Option<vk::PhysicalDevice>> {
-    let device = unsafe { instance.enumerate_physical_devices() }?
-        .into_iter()
-        .find(|&physical_device| {
-            unsafe { instance.enumerate_device_extension_properties(physical_device) }
-                .map(|exts| {
-                    let set: HashSet<&CStr> = exts
-                        .iter()
-                        .map(|ext| unsafe { CStr::from_ptr(&ext.extension_name as *const c_char) })
-                        .collect();
+    if let Err(e) = run() {
+        e.chain().rev().for_each(|e| error!("{e}"));
+        std::process::exit(1);
+    }
 
-                    required_extensions.iter().all(|ext| set.contains(ext))
-                })
-                .unwrap_or(false)
-        });
-
-    Ok(device)
+    Ok(())
 }
