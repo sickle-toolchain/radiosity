@@ -1,0 +1,19 @@
+[package]
+name = "radiosity-shader"
+version = "0.0.0"
+publish = false
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["dylib", "lib"]
+
+[dependencies]
+shared = { workspace = true }
+spirv-std = { workspace = true }
+bytemuck = { version = "1.24.0", features = [ "derive" ] }

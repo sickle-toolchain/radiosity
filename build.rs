@@ -4,7 +4,9 @@ use std::path::Path;
 use spirv_builder::{Capability, MetadataPrintout, SpirvBuilder};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let shader_crate_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("radiosity-shader");
+    let shader_crate_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("crates")
+        .join("shader");
     println!(
         "cargo::rerun-if-changed={}",
         shader_crate_path.join("Cargo.toml").display()
