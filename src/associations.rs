@@ -1,7 +1,7 @@
 use std::cell::Ref;
 
 use bsp::Bsp;
-use lump_definitions::source::{Edge, Face, LumpDefinition, Plane, TextureInfo};
+use lump_definitions::source::{Edge, Face, LumpDefinition, Plane, SurfaceEdge, TextureInfo};
 
 pub trait Associated<T: ?Sized> {
     fn associated<'a>(&self, bsp: &'a Bsp<'a>) -> Ref<'a, T>;
@@ -36,6 +36,11 @@ macro_rules! association {
         $lump[$self.$field as usize]
     };
 
+    // Rule for [|a|]
+    (@expression $self:ident, $lump:ident, [|$field:ident|]) => {
+        $lump[$self.$field.unsigned_abs() as usize]
+    };
+
     // Rule for [a..b]
     (@expression $self:ident, $lump:ident, [$field1:ident..$field2:ident]) => {
         $lump[$self.$field1 as usize..$self.$field2 as usize]
@@ -49,4 +54,5 @@ macro_rules! association {
 
 association!(Face, LumpDefinition::TextureInfo, [texture_info_index] -> TextureInfo);
 association!(Face, LumpDefinition::Planes, [plane_index] -> Plane);
-association!(Face, LumpDefinition::Edges, [edge_index..+edge_count] -> [Edge]);
+association!(Face, LumpDefinition::SurfaceEdges, [edge_index..+edge_count] -> [SurfaceEdge]);
+association!(SurfaceEdge, LumpDefinition::Edges, [|edge_index|] -> Edge);

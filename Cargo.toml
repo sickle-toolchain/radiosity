@@ -1,15 +1,41 @@
+[workspace]
+members = [ "crates/*"]
+
+[workspace.package]
+edition = "2024"
+authors = []
+license = ""
+repository = ""
+
+[workspace.dependencies]
+spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu" }
+shared = { path = "crates/shared" }
+
+[workspace.lints]
+
 [package]
 name = "radiosity"
 version = "0.1.0"
-edition = "2021"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
-[features]
-default = []
+[lints]
+workspace = true
 
 [dependencies]
 bsp = { git = "https://github.com/sickle-toolchain/bsp" }
 lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
+shared = { workspace = true }
+spirv-std = { workspace = true }
 
 clap = { version = "4.5.29", features = ["derive"] }
 zerocopy = "0.8.20"
-glam = "0.30.0"
+ash = "0.38.0"
+log = "0.4.28"
+env_logger = "0.11.8"
+anyhow = "1.0.100"
+
+[build-dependencies]
+spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }
