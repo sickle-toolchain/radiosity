@@ -77,6 +77,23 @@ impl<'a> Buffer<'a> {
             self.unmap();
         }
     }
+    
+    pub fn load<T: Copy>(&self, element_count: usize) -> Vec<T> {
+        unsafe {
+            let size = (std::mem::size_of::<T>() * element_count) as u64;
+            let mapped_ptr = self
+                .device
+                .map_memory(self.device_memory, 0, size, vk::MemoryMapFlags::empty())
+                .expect("Failed to map memory") as *const T;
+
+            let slice = std::slice::from_raw_parts(mapped_ptr, element_count);
+            let result = slice.to_vec();
+
+            self.device.unmap_memory(self.device_memory);
+
+            result
+        }
+    }
 
     fn map(&mut self, size: vk::DeviceSize) -> *mut c_void {
         unsafe {
