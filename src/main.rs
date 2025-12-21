@@ -409,8 +409,6 @@ fn run() -> Result<()> {
         .sum();
 
     let mut indices = Vec::with_capacity(index_capacity);
-
-    dbg!((indices.capacity(), indices.len()));
     for face in faces.iter() {
         let texture_data_idx =
             texture_info_lump[face.texture_info_index as usize].texture_data_index;
@@ -439,8 +437,6 @@ fn run() -> Result<()> {
             prev = current;
         }
     }
-
-    dbg!((indices.capacity(), indices.len()));
 
     let mut index_buffer = Buffer::new(
         &vk_ctx,
