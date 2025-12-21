@@ -605,8 +605,7 @@ fn run() -> Result<()> {
         let layouts = vec![descriptor_set_layout];
         let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
 
-        let pipeline_layout =
-            unsafe { device.create_pipeline_layout(&layout_create_info, None) }?;
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_create_info, None) }?;
 
         let shader_groups = vec![
             vk::RayTracingShaderGroupCreateInfoKHR::default()
@@ -735,8 +734,7 @@ fn run() -> Result<()> {
         .pool_sizes(&descriptor_sizes)
         .max_sets(1);
 
-    let descriptor_pool =
-        unsafe { device.create_descriptor_pool(&descriptor_pool_info, None) }?;
+    let descriptor_pool = unsafe { device.create_descriptor_pool(&descriptor_pool_info, None) }?;
 
     let mut count_allocate_info =
         vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&[1]);
@@ -873,7 +871,6 @@ fn run() -> Result<()> {
     }
 
     let lighting: Vec<AlignedVec3> = lighting_buffer.load(texels.len());
-    // dbg!(&lighting);
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
 
     // Drop immutable ref so we can take mutable ref
@@ -919,22 +916,18 @@ fn run() -> Result<()> {
     }
 
     unsafe {
-        device.destroy_descriptor_pool(descriptor_pool, None);
-        shader_binding_table_buffer.destroy();
         device.destroy_pipeline(graphics_pipeline, None);
-        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-    }
-
-    unsafe {
         device.destroy_pipeline_layout(pipeline_layout, None);
+        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
+        device.destroy_descriptor_pool(descriptor_pool, None);
     }
 
     blas.destroy();
     tlas.destroy();
 
+    shader_binding_table_buffer.destroy();
     texel_buffer.destroy();
     lighting_buffer.destroy();
-
     instance_buffer.destroy();
     vertex_buffer.destroy();
     index_buffer.destroy();
