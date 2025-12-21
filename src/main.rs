@@ -339,7 +339,7 @@ fn run() -> Result<()> {
 
     let mut vertex_buffer = Buffer::new(
         &vk_ctx,
-        (std::mem::size_of::<Vertex>() * vertices.len()) as u64,
+        (size_of::<Vertex>() * vertices.len()) as u64,
         vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
@@ -370,7 +370,7 @@ fn run() -> Result<()> {
 
     let mut texel_buffer = Buffer::new(
         &vk_ctx,
-        (std::mem::size_of::<TexelData>() * texels.len()) as u64,
+        (size_of::<TexelData>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
@@ -379,7 +379,7 @@ fn run() -> Result<()> {
 
     let mut lighting_buffer = Buffer::new(
         &vk_ctx,
-        (std::mem::size_of::<AlignedVec3>() * texels.len()) as u64,
+        (size_of::<AlignedVec3>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
@@ -398,80 +398,53 @@ fn run() -> Result<()> {
         .lump_cast::<[u8], _>(LumpDefinition::TextureDataStringData)
         .map_err(|_| anyhow!("Failed to get texture data string data lump"))?;
 
-    let indices = faces
+    let index_capacity = faces
         .iter()
-        // TEMPORARY: exclude skybox faces
-        // this lets us get light output without worldlight support
-        .filter(|face| {
-            let texture_data_idx =
-                texture_info_lump[face.texture_info_index as usize].texture_data_index;
-            let table_idx = texture_data_lump[texture_data_idx as usize].name_index;
-            let data_idx = texture_data_string_table[table_idx as usize];
-
-            let texture_name =
-                CStr::from_bytes_until_nul(&texture_data_string_data[data_idx as usize..])
-                    .unwrap()
-                    .to_string_lossy();
-            if texture_name.eq_ignore_ascii_case("TOOLS/TOOLSSKYBOX") {
-                return false;
-            }
-
-            true
-        })
-        .flat_map(|face| {
-            struct FanTriangulation<I, A>
-            where
-                I: Iterator<Item = A>,
-            {
-                iter: I,
-                pivot: Option<A>,
-                prev: Option<A>,
-            }
-
-            impl<I, A> FanTriangulation<I, A>
-            where
-                I: Iterator<Item = A>,
-            {
-                fn new(mut iter: I) -> Self {
-                    let pivot = iter.next();
-                    let prev = iter.next();
-                    FanTriangulation { iter, pivot, prev }
-                }
-            }
-
-            impl<I, A: Copy> Iterator for FanTriangulation<I, A>
-            where
-                I: Iterator<Item = A>,
-            {
-                type Item = [A; 3];
-
-                fn next(&mut self) -> Option<Self::Item> {
-                    if let (Some(pivot), Some(prev), Some(current)) =
-                        (self.pivot, self.prev, self.iter.next())
-                    {
-                        let triangle = [pivot, prev, current];
-                        self.prev = Some(current);
-                        Some(triangle)
-                    } else {
-                        None
-                    }
-                }
-            }
-
+        .map(|face| {
             let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
-            let indices = surface_edges.iter().map(|surface_edge| {
-                <SurfaceEdge as Associated<Edge>>::associated(surface_edge, &bsp).edge
-                    [usize::from(surface_edge.edge_index < 0)]
-            });
-
-            FanTriangulation::new(indices).collect::<Vec<_>>()
+            // n edges produces (n - 2) triangles, each triangle has 3 indices
+            let triangle_count = surface_edges.len().saturating_sub(2);
+            triangle_count * 3
         })
-        .flatten()
-        .collect::<Vec<_>>();
+        .sum();
+
+    let mut indices = Vec::with_capacity(index_capacity);
+
+    dbg!((indices.capacity(), indices.len()));
+    for face in faces.iter() {
+        let texture_data_idx =
+            texture_info_lump[face.texture_info_index as usize].texture_data_index;
+        let table_idx = texture_data_lump[texture_data_idx as usize].name_index;
+        let data_idx = texture_data_string_table[table_idx as usize];
+        let texture_name =
+            CStr::from_bytes_until_nul(&texture_data_string_data[data_idx as usize..])
+                .unwrap()
+                .to_string_lossy();
+        if texture_name.eq_ignore_ascii_case("TOOLS/TOOLSSKYBOX") {
+            continue;
+        }
+
+        let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
+
+        let mut it = surface_edges.iter().map(|surface_edge| {
+            <SurfaceEdge as Associated<Edge>>::associated(surface_edge, &bsp).edge
+                [usize::from(surface_edge.edge_index < 0)]
+        });
+
+        let Some(pivot) = it.next() else { continue };
+        let Some(mut prev) = it.next() else { continue };
+
+        for current in it {
+            indices.extend([pivot, prev, current]);
+            prev = current;
+        }
+    }
+
+    dbg!((indices.capacity(), indices.len()));
 
     let mut index_buffer = Buffer::new(
         &vk_ctx,
-        (std::mem::size_of::<u16>() * indices.len()) as u64,
+        (size_of::<u16>() * indices.len()) as u64,
         vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
@@ -487,7 +460,7 @@ fn run() -> Result<()> {
                     device_address: vertex_buffer.device_address(),
                 })
                 .max_vertex(vertices.len() as u32 - 1)
-                .vertex_stride(std::mem::size_of::<[f32; 3]>() as u64)
+                .vertex_stride(size_of::<[f32; 3]>() as u64)
                 .vertex_format(vk::Format::R32G32B32_SFLOAT)
                 .index_data(vk::DeviceOrHostAddressConstKHR {
                     device_address: index_buffer.device_address(),
@@ -521,7 +494,7 @@ fn run() -> Result<()> {
             },
         }];
         let instance_buffer_size =
-            std::mem::size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len();
+            size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len();
 
         let mut instance_buffer = Buffer::new(
             &vk_ctx,
