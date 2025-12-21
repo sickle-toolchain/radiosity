@@ -946,6 +946,7 @@ fn main() -> Result<()> {
     env_logger::builder()
         .filter_level(LevelFilter::Warn)
         .filter_module("radiosity", LevelFilter::Info)
+        .parse_env("RUST_LOG")
         .format_timestamp(None)
         .init();
 
