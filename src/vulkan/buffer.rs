@@ -1,9 +1,13 @@
 use std::ffi::c_void;
 
-use crate::vulkan::VkContext;
+use ash::Device;
+use ash::prelude::VkResult;
+use ash::util::Align;
+use ash::vk::{self, Handle};
+use log::debug;
 
 use super::PhysicalDeviceMemoryPropertiesExt;
-use ash::{prelude::VkResult, util::Align, vk, Device};
+use crate::vulkan::VkContext;
 
 pub struct Buffer<'a> {
     pub(crate) device: &'a Device,
@@ -49,6 +53,11 @@ impl<'a> Buffer<'a> {
             .memory_type_index(memory_index);
 
         let device_memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+        debug!(
+            "Allocated {} bytes @ 0x{:x}",
+            allocate_info.allocation_size,
+            device_memory.as_raw()
+        );
 
         unsafe { device.bind_buffer_memory(inner, device_memory, 0) }?;
 
@@ -77,7 +86,7 @@ impl<'a> Buffer<'a> {
             self.unmap();
         }
     }
-    
+
     pub fn load<T: Copy>(&self, element_count: usize) -> Vec<T> {
         unsafe {
             let size = (std::mem::size_of::<T>() * element_count) as u64;
