@@ -54,7 +54,7 @@ impl<'a> Buffer<'a> {
 
         let device_memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
         debug!(
-            "Allocated {} bytes @ 0x{:x}",
+            "Allocated 0x{:x} bytes @ 0x{:x}",
             allocate_info.allocation_size,
             device_memory.as_raw()
         );
