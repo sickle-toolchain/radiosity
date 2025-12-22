@@ -188,8 +188,6 @@ impl InstanceExt for Instance {
 }
 
 fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
-    use lump_definitions::source::{Plane, TextureInfo};
-
     let plane = <Face as Associated<Plane>>::associated(face, bsp);
     let tex = <Face as Associated<TextureInfo>>::associated(face, bsp);
 
