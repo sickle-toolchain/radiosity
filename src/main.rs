@@ -222,8 +222,11 @@ fn run() -> Result<()> {
     let contents = std::fs::read(args.bsp_path)?;
     let bsp = Bsp::parse(&contents).map_err(|_| anyhow!("failed to parse BSP file"))?;
 
-    // NOTE: we can't call any vulkan functions after this is dropped.
-    let entry = unsafe { Entry::load() }?;
+    let entry = if cfg!(feature = "ash-linked") {
+        Entry::linked()
+    } else {
+        unsafe { Entry::load() }?
+    };
 
     let mut instance_layers = vec![];
     if args.validation_layer {

@@ -24,6 +24,10 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = ["ash-linked"]
+ash-linked = ["ash/linked"]
+
 [dependencies]
 bsp = { git = "https://github.com/sickle-toolchain/bsp" }
 lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
