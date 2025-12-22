@@ -1,4 +1,6 @@
-use ash::{khr::acceleration_structure, prelude::VkResult, vk};
+use ash::khr::acceleration_structure;
+use ash::prelude::VkResult;
+use ash::vk;
 
 use crate::vulkan::VkContext;
 

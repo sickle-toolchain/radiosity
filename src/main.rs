@@ -19,7 +19,7 @@ use ash::khr::{
 use ash::prelude::VkResult;
 use ash::vk::{self, Packed24_8, PhysicalDevice};
 use ash::{Device, Entry, Instance};
-use spirv_std::glam::Vec3;
+use spirv_std::glam::{Mat3, Vec3};
 
 use bsp::Bsp;
 use lump_definitions::source::{
@@ -187,34 +187,35 @@ impl InstanceExt for Instance {
     }
 }
 
-fn luxel_to_world<'a>(face: &Face, bsp: &'a Bsp<'a>, s: f32, t: f32) -> Vec3 {
+fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
     use lump_definitions::source::{Plane, TextureInfo};
 
     let plane = <Face as Associated<Plane>>::associated(face, bsp);
     let tex = <Face as Associated<TextureInfo>>::associated(face, bsp);
 
-    let s_luxels = Vec3::from_array(tex.luxels[0].xyz);
-    let t_luxels = Vec3::from_array(tex.luxels[1].xyz);
-
-    let cross = t_luxels.cross(s_luxels);
-
+    let s_vec = Vec3::from_array(tex.luxels[0].xyz);
+    let t_vec = Vec3::from_array(tex.luxels[1].xyz);
     let normal = Vec3::from_array(plane.normal);
+
+    let cross = t_vec.cross(s_vec);
     let det = -normal.dot(cross);
+
     if det.abs() < 1.0e-20 {
         warn!("face vectors parallel to face normal");
     }
 
-    let luxel_to_world = [t_luxels.cross(normal) / det, normal.cross(s_luxels) / det];
+    let inv_det = 1.0 / det;
 
-    let luxel_origin = -(plane.dist * cross) / det
-        + luxel_to_world[0] * -tex.luxels[0].offset
-        + luxel_to_world[1] * -tex.luxels[1].offset;
+    let s_axis = t_vec.cross(normal) * inv_det;
+    let t_axis = normal.cross(s_vec) * inv_det;
 
     let [s_min, t_min] = face.lightmap.mins;
-    let s = s + s_min as f32;
-    let t = t + t_min as f32;
 
-    luxel_origin + luxel_to_world[0] * s + luxel_to_world[1] * t
+    let origin = cross * (-plane.dist * inv_det)
+        - s_axis * (tex.luxels[0].offset - s_min as f32)
+        - t_axis * (tex.luxels[1].offset - t_min as f32);
+
+    Mat3::from_cols(s_axis, t_axis, origin)
 }
 
 fn run() -> Result<()> {
@@ -360,9 +361,10 @@ fn run() -> Result<()> {
         let width = (face.lightmap.maxs[0] + 1) as u32;
         let height = (face.lightmap.maxs[1] + 1) as u32;
 
+        let matrix = luxel_to_world_matrix(face, &bsp);
         for t in 0..height {
             for s in 0..width {
-                let world_pos = luxel_to_world(face, &bsp, s as f32, t as f32);
+                let world_pos = matrix * Vec3::new(s as f32, t as f32, 1f32);
                 texels.push(TexelData::new(world_pos, normal));
             }
         }

@@ -3,7 +3,8 @@ mod buffer;
 
 use std::ffi::CStr;
 
-use ash::{prelude::VkResult, vk};
+use ash::prelude::VkResult;
+use ash::vk;
 
 pub use acceleration_structure::AccelerationStructure;
 pub use buffer::Buffer;
