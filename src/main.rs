@@ -17,10 +17,11 @@ use ash::khr::{
 };
 use ash::vk::{
     self, AccelerationStructureBuildRangeInfoKHR, AccelerationStructureGeometryKHR,
-    AccelerationStructureKHR, AccelerationStructureTypeKHR, BuildAccelerationStructureFlagsKHR,
-    Packed24_8, PhysicalDeviceRayTracingPipelinePropertiesKHR, QueryPool,
+    AccelerationStructureKHR, AccelerationStructureTypeKHR, BufferUsageFlags,
+    BuildAccelerationStructureFlagsKHR, MemoryPropertyFlags, Packed24_8,
+    PhysicalDeviceRayTracingPipelinePropertiesKHR, QueryPool,
 };
-use spirv_std::glam::{Mat3, Vec3};
+use spirv_std::glam::{Mat3, Mat4, Vec3};
 
 use bsp::Bsp;
 use lump_definitions::source::{
@@ -28,7 +29,7 @@ use lump_definitions::source::{
 };
 
 use radiosity::Associated;
-use radiosity::vulkan::{Buffer, VulkanContext};
+use radiosity::vulkan::{Buffer, GeometryIndex, VulkanContext};
 use shared::{AlignedVec3, TexelData};
 
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
@@ -78,6 +79,116 @@ impl Application<'_> {
             ray_tracing_pipeline_properties,
             timestamp_query_pool,
         })
+    }
+
+    // Create triangular acceleration structure geometry
+    fn create_triangle_geometry<I>(
+        &'_ self,
+        vertices: &[Vertex],
+        indices: &[I],
+    ) -> Result<(AccelerationStructureGeometryKHR<'_>, Buffer, Buffer)>
+    where
+        I: GeometryIndex + Copy,
+    {
+        const INPUT_BUFFER_FLAGS: BufferUsageFlags = BufferUsageFlags::from_raw(
+            BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
+                | BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw(),
+        );
+        const MEMORY_PROPERTYIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
+            MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+                | MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+        );
+
+        let mut vertex_buffer = Buffer::new(
+            self.ctx.clone(),
+            (size_of::<Vertex>() * vertices.len()) as u64,
+            INPUT_BUFFER_FLAGS | BufferUsageFlags::VERTEX_BUFFER,
+            MEMORY_PROPERTYIES,
+        )?;
+        vertex_buffer.store(&vertices);
+
+        let mut index_buffer = Buffer::new(
+            self.ctx.clone(),
+            (size_of::<I>() * indices.len()) as u64,
+            INPUT_BUFFER_FLAGS | BufferUsageFlags::INDEX_BUFFER,
+            MEMORY_PROPERTYIES,
+        )?;
+        index_buffer.store(&indices);
+
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR {
+                triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
+                    .vertex_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: vertex_buffer.device_address(),
+                    })
+                    .max_vertex(vertices.len() as u32 - 1)
+                    .vertex_stride(size_of::<[f32; 3]>() as u64)
+                    .vertex_format(vk::Format::R32G32B32_SFLOAT)
+                    .index_data(vk::DeviceOrHostAddressConstKHR {
+                        device_address: index_buffer.device_address(),
+                    })
+                    .index_type(vk::IndexType::UINT16),
+            })
+            .flags(vk::GeometryFlagsKHR::OPAQUE);
+
+        Ok((geometry, vertex_buffer, index_buffer))
+    }
+
+    // Create instance acceleration structure geometry
+    fn create_instance_geometry(
+        &'_ self,
+        instance: AccelerationStructureKHR,
+        matrix: [f32; 12],
+    ) -> Result<(AccelerationStructureGeometryKHR<'_>, Buffer)> {
+        const INPUT_BUFFER_FLAGS: BufferUsageFlags = BufferUsageFlags::from_raw(
+            BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
+                | BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw(),
+        );
+        const MEMORY_PROPERTYIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
+            MemoryPropertyFlags::HOST_VISIBLE.as_raw()
+                | MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+        );
+
+        let device_handle = unsafe {
+            self.acceleration_structure_device
+                .get_acceleration_structure_device_address(
+                    &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                        .acceleration_structure(instance),
+                )
+        };
+
+        let instances = [vk::AccelerationStructureInstanceKHR {
+            transform: vk::TransformMatrixKHR { matrix },
+            instance_custom_index_and_mask: Packed24_8::new(0, 0xff),
+            instance_shader_binding_table_record_offset_and_flags: Packed24_8::new(
+                0,
+                vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
+            ),
+            acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
+                device_handle,
+            },
+        }];
+
+        let mut instance_buffer = Buffer::new(
+            self.ctx.clone(),
+            (size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len()) as vk::DeviceSize,
+            INPUT_BUFFER_FLAGS,
+            MEMORY_PROPERTYIES,
+        )?;
+        instance_buffer.store(&instances);
+
+        let instances = vk::AccelerationStructureGeometryInstancesDataKHR::default()
+            .array_of_pointers(false)
+            .data(vk::DeviceOrHostAddressConstKHR {
+                device_address: instance_buffer.device_address(),
+            });
+
+        let geometry = vk::AccelerationStructureGeometryKHR::default()
+            .geometry_type(vk::GeometryTypeKHR::INSTANCES)
+            .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
+
+        Ok((geometry, instance_buffer))
     }
 
     // Create acceleration structure
@@ -419,90 +530,23 @@ fn run() -> Result<()> {
         }
     }
 
-    let mut index_buffer = Buffer::new(
-        ctx.clone(),
-        (size_of::<u16>() * indices.len()) as u64,
-        vk::BufferUsageFlags::INDEX_BUFFER
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
-    index_buffer.store(&indices);
-
-    let geometry = vk::AccelerationStructureGeometryKHR::default()
-        .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
-        .geometry(vk::AccelerationStructureGeometryDataKHR {
-            triangles: vk::AccelerationStructureGeometryTrianglesDataKHR::default()
-                .vertex_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: vertex_buffer.device_address(),
-                })
-                .max_vertex(vertices.len() as u32 - 1)
-                .vertex_stride(size_of::<[f32; 3]>() as u64)
-                .vertex_format(vk::Format::R32G32B32_SFLOAT)
-                .index_data(vk::DeviceOrHostAddressConstKHR {
-                    device_address: index_buffer.device_address(),
-                })
-                .index_type(vk::IndexType::UINT16),
-        })
-        .flags(vk::GeometryFlagsKHR::OPAQUE);
-
+    let (blas_geometry, _vertex_buffer, _index_buffer) =
+        app.create_triangle_geometry(&vertices, &indices)?;
     let (blas, _blas_buffer) = app.create_as(
         AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-        &[geometry],
+        &[blas_geometry],
         &[vk::AccelerationStructureBuildRangeInfoKHR::default()
             .primitive_count(indices.len() as u32 / 3)],
         vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
     )?;
 
-    let instance_buffer = {
-        let instances = [vk::AccelerationStructureInstanceKHR {
-            transform: vk::TransformMatrixKHR {
-                matrix: [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-            },
-            instance_custom_index_and_mask: Packed24_8::new(0, 0xff),
-            instance_shader_binding_table_record_offset_and_flags: Packed24_8::new(
-                0,
-                vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
-            ),
-            acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: unsafe {
-                    app.acceleration_structure_device
-                        .get_acceleration_structure_device_address(
-                            &vk::AccelerationStructureDeviceAddressInfoKHR::default()
-                                .acceleration_structure(blas),
-                        )
-                },
-            },
-        }];
-        let instance_buffer_size =
-            size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len();
-
-        let mut instance_buffer = Buffer::new(
-            ctx.clone(),
-            instance_buffer_size as vk::DeviceSize,
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
-        instance_buffer.store(&instances);
-
-        instance_buffer
-    };
-
-    let instances = vk::AccelerationStructureGeometryInstancesDataKHR::default()
-        .array_of_pointers(false)
-        .data(vk::DeviceOrHostAddressConstKHR {
-            device_address: instance_buffer.device_address(),
-        });
-
-    let geometry = vk::AccelerationStructureGeometryKHR::default()
-        .geometry_type(vk::GeometryTypeKHR::INSTANCES)
-        .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
+    let identity_matrix: [f32; 12] = std::array::from_fn(|i| Mat4::IDENTITY.to_cols_array()[i]);
+    let (tlas_geometry, _tlas_geometry_buffer) =
+        app.create_instance_geometry(blas, identity_matrix)?;
 
     let (tlas, _tlas_buffer) = app.create_as(
         AccelerationStructureTypeKHR::TOP_LEVEL,
-        &[geometry],
+        &[tlas_geometry],
         &[vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1)],
         vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
     )?;
