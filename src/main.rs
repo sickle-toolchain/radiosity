@@ -1,24 +1,25 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
-use std::ffi::{CStr, c_void};
+use std::ffi::CStr;
 use std::fs::File;
-use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::ptr;
+use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use log::{Level, LevelFilter, error, info, log, warn};
+use log::{LevelFilter, error, info, warn};
 use zerocopy::IntoBytes;
 
-use ash::ext::{debug_utils, scalar_block_layout};
+use ash::ext::scalar_block_layout;
 use ash::khr::{
     acceleration_structure, deferred_host_operations, get_memory_requirements2,
     ray_tracing_pipeline, spirv_1_4,
 };
-use ash::prelude::VkResult;
-use ash::vk::{self, Packed24_8, PhysicalDevice};
-use ash::{Device, Entry, Instance};
+use ash::vk::{
+    self, AccelerationStructureBuildRangeInfoKHR, AccelerationStructureGeometryKHR,
+    AccelerationStructureKHR, AccelerationStructureTypeKHR, BuildAccelerationStructureFlagsKHR,
+    Packed24_8, PhysicalDeviceRayTracingPipelinePropertiesKHR, QueryPool,
+};
 use spirv_std::glam::{Mat3, Vec3};
 
 use bsp::Bsp;
@@ -27,10 +28,215 @@ use lump_definitions::source::{
 };
 
 use radiosity::Associated;
-use radiosity::vulkan::{AccelerationStructure, ApplicationInfoExt, Buffer, VkContext};
+use radiosity::vulkan::{Buffer, VulkanContext};
 use shared::{AlignedVec3, TexelData};
 
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
+
+pub struct Application<'a> {
+    pub ctx: Rc<VulkanContext>,
+    pub acceleration_structure_device: acceleration_structure::Device,
+    pub ray_tracing_pipeline_device: ray_tracing_pipeline::Device,
+    pub ray_tracing_pipeline_properties: PhysicalDeviceRayTracingPipelinePropertiesKHR<'a>,
+    pub timestamp_query_pool: QueryPool,
+}
+
+impl Application<'_> {
+    pub fn new(ctx: Rc<VulkanContext>) -> Result<Self> {
+        let acceleration_structure_device =
+            acceleration_structure::Device::new(&ctx.instance, &ctx.device);
+        let ray_tracing_pipeline_device =
+            ray_tracing_pipeline::Device::new(&ctx.instance, &ctx.device);
+
+        let mut ray_tracing_pipeline_properties =
+            PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        {
+            let mut physical_device_properties2 = vk::PhysicalDeviceProperties2::default()
+                .push_next(&mut ray_tracing_pipeline_properties);
+
+            unsafe {
+                ctx.instance.get_physical_device_properties2(
+                    ctx.physical_device,
+                    &mut physical_device_properties2,
+                );
+            }
+        }
+
+        let timestamp_query_pool_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(2);
+
+        let timestamp_query_pool = unsafe {
+            ctx.device
+                .create_query_pool(&timestamp_query_pool_info, None)?
+        };
+
+        Ok(Self {
+            ctx,
+            acceleration_structure_device,
+            ray_tracing_pipeline_device,
+            ray_tracing_pipeline_properties,
+            timestamp_query_pool,
+        })
+    }
+
+    // Create acceleration structure
+    fn create_as(
+        &self,
+        structure_type: AccelerationStructureTypeKHR,
+        geometries: &[AccelerationStructureGeometryKHR],
+        build_range_info: &[AccelerationStructureBuildRangeInfoKHR],
+        flags: BuildAccelerationStructureFlagsKHR,
+    ) -> Result<(AccelerationStructureKHR, Buffer)> {
+        let mut build_info = vk::AccelerationStructureBuildGeometryInfoKHR::default()
+            .flags(flags)
+            .geometries(geometries)
+            .mode(vk::BuildAccelerationStructureModeKHR::BUILD)
+            .ty(structure_type);
+
+        let mut sizes_info = vk::AccelerationStructureBuildSizesInfoKHR::default();
+        unsafe {
+            self.acceleration_structure_device
+                .get_acceleration_structure_build_sizes(
+                    vk::AccelerationStructureBuildTypeKHR::DEVICE,
+                    &build_info,
+                    build_range_info
+                        .iter()
+                        .map(|r| r.primitive_count)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    &mut sizes_info,
+                );
+        };
+
+        let buffer = Buffer::new(
+            self.ctx.clone(),
+            sizes_info.acceleration_structure_size,
+            vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+
+        let create_info = vk::AccelerationStructureCreateInfoKHR::default()
+            .ty(build_info.ty)
+            .size(sizes_info.acceleration_structure_size)
+            .buffer(buffer.handle())
+            .offset(0);
+
+        let acceleration_structure = unsafe {
+            self.acceleration_structure_device
+                .create_acceleration_structure(&create_info, None)
+        }?;
+        build_info.dst_acceleration_structure = acceleration_structure;
+
+        let scratch_buffer = Buffer::new(
+            self.ctx.clone(),
+            sizes_info.acceleration_structure_size,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+
+        build_info.scratch_data = vk::DeviceOrHostAddressKHR {
+            device_address: scratch_buffer.device_address(),
+        };
+
+        let build_command_buffer = {
+            let allocate_info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(1)
+                .command_pool(self.ctx.pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+
+            let command_buffers =
+                unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }.unwrap();
+            command_buffers[0]
+        };
+
+        unsafe {
+            self.ctx
+                .device
+                .begin_command_buffer(
+                    build_command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+
+            self.ctx.device.cmd_reset_query_pool(
+                build_command_buffer,
+                self.timestamp_query_pool,
+                0,
+                2,
+            );
+
+            self.ctx.device.cmd_write_timestamp(
+                build_command_buffer,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                self.timestamp_query_pool,
+                0,
+            );
+
+            self.acceleration_structure_device
+                .cmd_build_acceleration_structures(
+                    build_command_buffer,
+                    &[build_info],
+                    &[build_range_info],
+                );
+
+            self.ctx.device.cmd_write_timestamp(
+                build_command_buffer,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                self.timestamp_query_pool,
+                1,
+            );
+            self.ctx
+                .device
+                .end_command_buffer(build_command_buffer)
+                .unwrap();
+            self.ctx.device.queue_submit(
+                self.ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(&[build_command_buffer])],
+                vk::Fence::null(),
+            )?;
+
+            self.ctx.device.queue_wait_idle(self.ctx.queue).unwrap();
+            self.ctx
+                .device
+                .free_command_buffers(self.ctx.pool, &[build_command_buffer]);
+        }
+        let mut timestamps = [0u64; 2];
+
+        unsafe {
+            self.ctx.device.get_query_pool_results(
+                self.timestamp_query_pool,
+                0,
+                &mut timestamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )?;
+        }
+
+        let timestamp_period = self.ctx.physical_device_properties.limits.timestamp_period;
+        let delta_ticks = timestamps[1] - timestamps[0];
+        let time_ns = delta_ticks as f64 * timestamp_period as f64;
+
+        info!(
+            "Built {structure_type:#?} acceleration structure in {:.3} ms",
+            time_ns / 1_000_000f64
+        );
+
+        Ok((acceleration_structure, buffer))
+    }
+}
+
+impl Drop for Application<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            self.ctx
+                .device
+                .destroy_query_pool(self.timestamp_query_pool, None);
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
@@ -49,142 +255,6 @@ struct Args {
     /// Force use of specific device id
     #[arg(help_heading = "vulkan", long)]
     device_id: Option<u32>,
-}
-
-pub extern "system" fn vulkan_debug_utils_callback(
-    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
-    _message_type: vk::DebugUtilsMessageTypeFlagsEXT,
-    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
-    _p_user_data: *mut c_void,
-) -> vk::Bool32 {
-    let level = match message_severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => Level::Debug,
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => Level::Warn,
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => Level::Error,
-        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => Level::Info,
-        _ => unreachable!(),
-    };
-
-    let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }.to_string_lossy();
-    log!(target: "vulkan", level, "{message}");
-
-    vk::FALSE
-}
-
-fn create_vk_instance(entry: &Entry, layers: Vec<&CStr>) -> Result<Instance> {
-    let instance_layer_properties = unsafe { entry.enumerate_instance_layer_properties() }?;
-    let instance_layers: Vec<&CStr> = instance_layer_properties
-        .iter()
-        .filter_map(|p| p.layer_name_as_c_str().ok())
-        .collect();
-
-    for layer in &layers {
-        if !instance_layers.contains(layer) {
-            bail!("Layer '{}' is not suppported", layer.to_string_lossy());
-        }
-    }
-
-    let instance = {
-        let application_info = vk::ApplicationInfo::default()
-            .application_from_env()
-            .api_version(vk::API_VERSION_1_2);
-
-        let enabled_extension_names = vec![debug_utils::NAME.as_ptr()];
-        let mut debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-            .message_severity(
-                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
-            )
-            .message_type(
-                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-            )
-            .pfn_user_callback(Some(vulkan_debug_utils_callback));
-
-        let enabled_layer_names = layers.iter().map(|l| l.as_ptr()).collect::<Vec<_>>();
-
-        let instance_create_info = vk::InstanceCreateInfo::default()
-            .application_info(&application_info)
-            .enabled_layer_names(enabled_layer_names.as_slice())
-            .enabled_extension_names(enabled_extension_names.as_slice())
-            .push_next(&mut debug_utils_create_info);
-
-        unsafe { entry.create_instance(&instance_create_info, None) }
-            .context("Failed to create instance")?
-    };
-
-    Ok(instance)
-}
-
-pub trait PhysicalDeviceExt {
-    fn find_queue_family_idx(
-        &self,
-        instance: &Instance,
-        pred: fn(&vk::QueueFamilyProperties) -> bool,
-    ) -> Option<u32>;
-}
-
-impl PhysicalDeviceExt for PhysicalDevice {
-    fn find_queue_family_idx(
-        &self,
-        instance: &Instance,
-        pred: fn(&vk::QueueFamilyProperties) -> bool,
-    ) -> Option<u32> {
-        unsafe { instance.get_physical_device_queue_family_properties(*self) }
-            .into_iter()
-            .enumerate()
-            .find(|(_, device_properties)| pred(device_properties))
-            .map(|(idx, _)| idx as u32)
-    }
-}
-
-pub trait InstanceExt {
-    fn physical_device_by_id(&self, id: u32) -> VkResult<Option<PhysicalDevice>>;
-    fn find_physical_device(
-        &self,
-        required_extensions: &[&CStr],
-    ) -> VkResult<Option<PhysicalDevice>>;
-}
-
-impl InstanceExt for Instance {
-    fn physical_device_by_id(&self, id: u32) -> VkResult<Option<PhysicalDevice>> {
-        let device = unsafe { self.enumerate_physical_devices()? }
-            .iter()
-            .find(|&&physical_device| {
-                let props = unsafe { self.get_physical_device_properties(physical_device) };
-                props.device_id == id
-            })
-            .copied();
-
-        Ok(device)
-    }
-
-    fn find_physical_device(
-        &self,
-        required_extensions: &[&CStr],
-    ) -> VkResult<Option<PhysicalDevice>> {
-        let device = unsafe { self.enumerate_physical_devices() }?
-            .into_iter()
-            .find(|&physical_device| {
-                unsafe { self.enumerate_device_extension_properties(physical_device) }
-                    .map(|exts| {
-                        let set: HashSet<&CStr> = exts
-                            .iter()
-                            .map(|ext| unsafe {
-                                CStr::from_ptr(&ext.extension_name as *const c_char)
-                            })
-                            .collect();
-
-                        required_extensions.iter().all(|ext| set.contains(ext))
-                    })
-                    .unwrap_or(false)
-            });
-
-        Ok(device)
-    }
 }
 
 fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
@@ -222,19 +292,12 @@ fn run() -> Result<()> {
     let contents = std::fs::read(args.bsp_path)?;
     let bsp = Bsp::parse(&contents).map_err(|_| anyhow!("failed to parse BSP file"))?;
 
-    let entry = if cfg!(feature = "ash-linked") {
-        Entry::linked()
-    } else {
-        unsafe { Entry::load() }?
-    };
-
     let mut instance_layers = vec![];
     if args.validation_layer {
-        instance_layers.push(c"VK_LAYER_KHRONOS_validation")
+        instance_layers.push(c"VK_LAYER_KHRONOS_validation");
     }
 
-    let instance = create_vk_instance(&entry, instance_layers)?;
-    let extensions = &[
+    let device_layers = [
         acceleration_structure::NAME,
         deferred_host_operations::NAME,
         ray_tracing_pipeline::NAME,
@@ -243,104 +306,19 @@ fn run() -> Result<()> {
         get_memory_requirements2::NAME,
     ];
 
-    let physical_device = if let Some(id) = args.device_id {
-        instance.physical_device_by_id(id)?
-    } else {
-        instance.find_physical_device(extensions)?
-    }
-    .context("Failed to find physical device")?;
-
-    let physical_device_properties =
-        unsafe { instance.get_physical_device_properties(physical_device) };
-    info!(
-        "Selected device '{}' ({})",
-        physical_device_properties
-            .device_name_as_c_str()
-            .map(CStr::to_string_lossy)
-            .unwrap_or(Cow::Borrowed("unknown")),
-        physical_device_properties.device_id
-    );
-
-    let queue_family_idx = physical_device
-        .find_queue_family_idx(&instance, |prop| {
-            prop.queue_count > 0 && prop.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-        })
-        .context("Failed to find queue family index")?;
-
-    let device: Device = {
-        let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
-            .queue_family_index(queue_family_idx)
-            .queue_priorities(&[1.0])];
-
-        let mut features2 = vk::PhysicalDeviceFeatures2::default();
-        unsafe {
-            instance.get_physical_device_features2(physical_device, &mut features2);
-        };
-
-        let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
-            .buffer_device_address(true)
-            .vulkan_memory_model(true);
-
-        let mut acceleration_structure_features =
-            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
-                .acceleration_structure(true);
-
-        let mut raytracing_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
-
-        let enabled_extension_names = extensions.iter().map(|c| c.as_ptr()).collect::<Vec<_>>();
-
-        let device_create_info = vk::DeviceCreateInfo::default()
-            .push_next(&mut features2)
-            .push_next(&mut features12)
-            .push_next(&mut acceleration_structure_features)
-            .push_next(&mut raytracing_pipeline_features)
-            .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(enabled_extension_names.as_slice());
-
-        unsafe { instance.create_device(physical_device, &device_create_info, None) }
-            .context("Failed to create device")?
-    };
-
-    let device_queue = unsafe { device.get_device_queue(queue_family_idx, 0) };
-
-    let command_pool = {
-        let command_pool_create_info =
-            vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_idx);
-
-        unsafe { device.create_command_pool(&command_pool_create_info, None) }
-            .context("Failed to create command pool")?
-    };
-
-    let device_memory_properties =
-        unsafe { instance.get_physical_device_memory_properties(physical_device) };
-
-    let vk_ctx = VkContext::new(
-        &device,
-        &device_queue,
-        &command_pool,
-        &device_memory_properties,
-    )?;
-
-    let as_device = acceleration_structure::Device::new(&instance, &device);
-    let rt_pipeline_device = ray_tracing_pipeline::Device::new(&instance, &device);
-    let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
-    {
-        let mut physical_device_properties2 =
-            vk::PhysicalDeviceProperties2::default().push_next(&mut rt_pipeline_properties);
-
-        unsafe {
-            instance
-                .get_physical_device_properties2(physical_device, &mut physical_device_properties2);
-        }
-    }
+    let ctx = Rc::new(VulkanContext::new(
+        &instance_layers,
+        &device_layers,
+        args.device_id,
+    )?);
+    let app = Application::new(ctx.clone())?;
 
     let vertices = bsp
         .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
         .map_err(|_| anyhow!("Failed to get vertices lump"))?;
 
     let mut vertex_buffer = Buffer::new(
-        &vk_ctx,
+        ctx.clone(),
         (size_of::<Vertex>() * vertices.len()) as u64,
         vk::BufferUsageFlags::VERTEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -372,7 +350,7 @@ fn run() -> Result<()> {
     }
 
     let mut texel_buffer = Buffer::new(
-        &vk_ctx,
+        ctx.clone(),
         (size_of::<TexelData>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -381,7 +359,7 @@ fn run() -> Result<()> {
     texel_buffer.store(&texels);
 
     let mut lighting_buffer = Buffer::new(
-        &vk_ctx,
+        ctx.clone(),
         (size_of::<AlignedVec3>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -442,7 +420,7 @@ fn run() -> Result<()> {
     }
 
     let mut index_buffer = Buffer::new(
-        &vk_ctx,
+        ctx.clone(),
         (size_of::<u16>() * indices.len()) as u64,
         vk::BufferUsageFlags::INDEX_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
@@ -468,10 +446,8 @@ fn run() -> Result<()> {
         })
         .flags(vk::GeometryFlagsKHR::OPAQUE);
 
-    let blas = AccelerationStructure::build(
-        &vk_ctx,
-        &as_device,
-        vk::AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+    let (blas, _blas_buffer) = app.create_as(
+        AccelerationStructureTypeKHR::BOTTOM_LEVEL,
         &[geometry],
         &[vk::AccelerationStructureBuildRangeInfoKHR::default()
             .primitive_count(indices.len() as u32 / 3)],
@@ -489,14 +465,20 @@ fn run() -> Result<()> {
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
             ),
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
-                device_handle: blas.device_address(),
+                device_handle: unsafe {
+                    app.acceleration_structure_device
+                        .get_acceleration_structure_device_address(
+                            &vk::AccelerationStructureDeviceAddressInfoKHR::default()
+                                .acceleration_structure(blas),
+                        )
+                },
             },
         }];
         let instance_buffer_size =
             size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len();
 
         let mut instance_buffer = Buffer::new(
-            &vk_ctx,
+            ctx.clone(),
             instance_buffer_size as vk::DeviceSize,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
@@ -518,10 +500,8 @@ fn run() -> Result<()> {
         .geometry_type(vk::GeometryTypeKHR::INSTANCES)
         .geometry(vk::AccelerationStructureGeometryDataKHR { instances });
 
-    let tlas = AccelerationStructure::build(
-        &vk_ctx,
-        &as_device,
-        vk::AccelerationStructureTypeKHR::TOP_LEVEL,
+    let (tlas, _tlas_buffer) = app.create_as(
+        AccelerationStructureTypeKHR::TOP_LEVEL,
         &[geometry],
         &[vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1)],
         vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
@@ -538,7 +518,7 @@ fn run() -> Result<()> {
             .binding_flags(&binding_flags_inner);
 
         let descriptor_set_layout = unsafe {
-            device.create_descriptor_set_layout(
+            ctx.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()
                     .bindings(&[
                         vk::DescriptorSetLayoutBinding::default()
@@ -571,13 +551,16 @@ fn run() -> Result<()> {
             ..Default::default()
         };
 
-        let shader_module =
-            unsafe { device.create_shader_module(&shader_module_create_info, None) }?;
+        let shader_module = unsafe {
+            ctx.device
+                .create_shader_module(&shader_module_create_info, None)
+        }?;
 
         let layouts = vec![descriptor_set_layout];
         let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
 
-        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_create_info, None) }?;
+        let pipeline_layout =
+            unsafe { ctx.device.create_pipeline_layout(&layout_create_info, None) }?;
 
         let shader_groups = vec![
             vk::RayTracingShaderGroupCreateInfoKHR::default()
@@ -616,21 +599,22 @@ fn run() -> Result<()> {
         ];
 
         let pipeline = unsafe {
-            rt_pipeline_device.create_ray_tracing_pipelines(
-                vk::DeferredOperationKHR::null(),
-                vk::PipelineCache::null(),
-                &[vk::RayTracingPipelineCreateInfoKHR::default()
-                    .stages(&shader_stages)
-                    .groups(&shader_groups)
-                    .max_pipeline_ray_recursion_depth(1)
-                    .layout(pipeline_layout)],
-                None,
-            )
+            app.ray_tracing_pipeline_device
+                .create_ray_tracing_pipelines(
+                    vk::DeferredOperationKHR::null(),
+                    vk::PipelineCache::null(),
+                    &[vk::RayTracingPipelineCreateInfoKHR::default()
+                        .stages(&shader_stages)
+                        .groups(&shader_groups)
+                        .max_pipeline_ray_recursion_depth(1)
+                        .layout(pipeline_layout)],
+                    None,
+                )
         }
         .map_err(|(_, result)| result)?[0];
 
         unsafe {
-            device.destroy_shader_module(shader_module, None);
+            ctx.device.destroy_shader_module(shader_module, None);
         }
 
         (
@@ -644,32 +628,41 @@ fn run() -> Result<()> {
     let command_buffer = {
         let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
             .command_buffer_count(1)
-            .command_pool(command_pool)
+            .command_pool(ctx.pool)
             .level(vk::CommandBufferLevel::PRIMARY);
 
-        unsafe { device.allocate_command_buffers(&command_buffer_allocate_info) }?[0]
+        unsafe {
+            ctx.device
+                .allocate_command_buffers(&command_buffer_allocate_info)
+        }?[0]
     };
 
     {
         let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
 
-        unsafe { device.begin_command_buffer(command_buffer, &command_buffer_begin_info) }?;
+        unsafe {
+            ctx.device
+                .begin_command_buffer(command_buffer, &command_buffer_begin_info)
+        }?;
     }
 
-    let handle_size = rt_pipeline_properties.shader_group_handle_size as usize;
-    let handle_alignment = rt_pipeline_properties.shader_group_base_alignment as usize;
+    let handle_size = app.ray_tracing_pipeline_properties.shader_group_handle_size as usize;
+    let handle_alignment = app
+        .ray_tracing_pipeline_properties
+        .shader_group_base_alignment as usize;
 
     let handle_size_aligned = (handle_size + handle_alignment - 1) & !(handle_alignment - 1);
 
     let shader_binding_table_buffer = {
         let incoming_table_data = unsafe {
-            rt_pipeline_device.get_ray_tracing_shader_group_handles(
-                graphics_pipeline,
-                0,
-                shader_group_count as u32,
-                shader_group_count * handle_size,
-            )
+            app.ray_tracing_pipeline_device
+                .get_ray_tracing_shader_group_handles(
+                    graphics_pipeline,
+                    0,
+                    shader_group_count as u32,
+                    shader_group_count * handle_size,
+                )
         }?;
 
         let table_size = shader_group_count * handle_size_aligned;
@@ -684,7 +677,7 @@ fn run() -> Result<()> {
         }
 
         let mut shader_binding_table_buffer = Buffer::new(
-            &vk_ctx,
+            ctx.clone(),
             table_size as u64,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                 | vk::BufferUsageFlags::TRANSFER_SRC
@@ -706,13 +699,16 @@ fn run() -> Result<()> {
         .pool_sizes(&descriptor_sizes)
         .max_sets(1);
 
-    let descriptor_pool = unsafe { device.create_descriptor_pool(&descriptor_pool_info, None) }?;
+    let descriptor_pool = unsafe {
+        ctx.device
+            .create_descriptor_pool(&descriptor_pool_info, None)
+    }?;
 
     let mut count_allocate_info =
         vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&[1]);
 
     let descriptor_set = unsafe {
-        device.allocate_descriptor_sets(
+        ctx.device.allocate_descriptor_sets(
             &vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(descriptor_pool)
                 .set_layouts(&[descriptor_set_layout])
@@ -720,7 +716,7 @@ fn run() -> Result<()> {
         )
     }?[0];
 
-    let accel_structs = [tlas.handle()];
+    let accel_structs = [tlas];
     let mut accel_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
         .acceleration_structures(&accel_structs);
 
@@ -757,7 +753,8 @@ fn run() -> Result<()> {
         .descriptor_count(1);
 
     unsafe {
-        device.update_descriptor_sets(&[accel_write, texel_write, lighting_write], &[]);
+        ctx.device
+            .update_descriptor_sets(&[accel_write, texel_write, lighting_write], &[]);
     }
 
     {
@@ -782,12 +779,12 @@ fn run() -> Result<()> {
         let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
 
         unsafe {
-            device.cmd_bind_pipeline(
+            ctx.device.cmd_bind_pipeline(
                 command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 graphics_pipeline,
             );
-            device.cmd_bind_descriptor_sets(
+            ctx.device.cmd_bind_descriptor_sets(
                 command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 pipeline_layout,
@@ -796,7 +793,7 @@ fn run() -> Result<()> {
                 &[],
             );
 
-            rt_pipeline_device.cmd_trace_rays(
+            app.ray_tracing_pipeline_device.cmd_trace_rays(
                 command_buffer,
                 &sbt_raygen_region,
                 &sbt_miss_region,
@@ -816,7 +813,7 @@ fn run() -> Result<()> {
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
 
-            device.cmd_pipeline_barrier(
+            ctx.device.cmd_pipeline_barrier(
                 command_buffer,
                 vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
                 vk::PipelineStageFlags::HOST,
@@ -826,20 +823,20 @@ fn run() -> Result<()> {
                 &[],
             );
 
-            device.end_command_buffer(command_buffer)?;
+            ctx.device.end_command_buffer(command_buffer)?;
         }
     }
 
     unsafe {
-        device
+        ctx.device
             .queue_submit(
-                device_queue,
+                ctx.queue,
                 &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
                 vk::Fence::null(),
             )
             .context("Failed to execute queue submit.")?;
 
-        device.queue_wait_idle(device_queue)?;
+        ctx.device.queue_wait_idle(ctx.queue)?;
     }
 
     let lighting: Vec<AlignedVec3> = lighting_buffer.load(texels.len());
@@ -884,37 +881,26 @@ fn run() -> Result<()> {
         .context("writing to io failed")?;
 
     unsafe {
-        device.destroy_command_pool(command_pool, None);
+        ctx.device.destroy_pipeline(graphics_pipeline, None);
+        ctx.device.destroy_pipeline_layout(pipeline_layout, None);
+        ctx.device
+            .destroy_descriptor_set_layout(descriptor_set_layout, None);
+        ctx.device.destroy_descriptor_pool(descriptor_pool, None);
     }
 
     unsafe {
-        device.destroy_pipeline(graphics_pipeline, None);
-        device.destroy_pipeline_layout(pipeline_layout, None);
-        device.destroy_descriptor_set_layout(descriptor_set_layout, None);
-        device.destroy_descriptor_pool(descriptor_pool, None);
-    }
-
-    blas.destroy();
-    tlas.destroy();
-
-    shader_binding_table_buffer.destroy();
-    texel_buffer.destroy();
-    lighting_buffer.destroy();
-    instance_buffer.destroy();
-    vertex_buffer.destroy();
-    index_buffer.destroy();
-
-    unsafe {
-        device.destroy_device(None);
+        app.acceleration_structure_device
+            .destroy_acceleration_structure(blas, None);
     }
 
     unsafe {
-        instance.destroy_instance(None);
+        app.acceleration_structure_device
+            .destroy_acceleration_structure(tlas, None);
     }
 
     Ok(())
 }
-fn main() -> Result<()> {
+fn main() {
     env_logger::builder()
         .filter_level(LevelFilter::Warn)
         .filter_module("radiosity", LevelFilter::Info)
@@ -926,6 +912,4 @@ fn main() -> Result<()> {
         e.chain().rev().for_each(|e| error!("{e}"));
         std::process::exit(1);
     }
-
-    Ok(())
 }

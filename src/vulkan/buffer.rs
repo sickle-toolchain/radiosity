@@ -1,27 +1,24 @@
 use std::ffi::c_void;
+use std::rc::Rc;
 
-use ash::Device;
+use log::debug;
+
 use ash::prelude::VkResult;
 use ash::util::Align;
 use ash::vk::{self, Handle};
-use log::debug;
 
 use super::PhysicalDeviceMemoryPropertiesExt;
-use crate::vulkan::VkContext;
+use crate::vulkan::VulkanContext;
 
-pub struct Buffer<'a> {
-    pub(crate) device: &'a Device,
+pub struct Buffer {
+    pub(crate) ctx: Rc<VulkanContext>,
     pub(crate) inner: vk::Buffer,
     pub(crate) device_memory: vk::DeviceMemory,
 }
 
-impl<'a> Buffer<'a> {
+impl Buffer {
     pub fn new(
-        VkContext {
-            device,
-            device_memory_properties,
-            ..
-        }: &'a VkContext<'_>,
+        ctx: Rc<VulkanContext>,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         memory_properties: vk::MemoryPropertyFlags,
@@ -30,11 +27,12 @@ impl<'a> Buffer<'a> {
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let inner = unsafe { device.create_buffer(&buffer_info, None) }?;
+        let inner = unsafe { ctx.device.create_buffer(&buffer_info, None) }?;
 
-        let memory_req = unsafe { device.get_buffer_memory_requirements(inner) };
+        let memory_req = unsafe { ctx.device.get_buffer_memory_requirements(inner) };
 
-        let memory_index = device_memory_properties
+        let memory_index = ctx
+            .physical_device_memory_properties
             .mem_ty_idx(memory_req.memory_type_bits, memory_properties)
             .expect("Failed to get memory type");
 
@@ -52,18 +50,18 @@ impl<'a> Buffer<'a> {
             .allocation_size(memory_req.size)
             .memory_type_index(memory_index);
 
-        let device_memory = unsafe { device.allocate_memory(&allocate_info, None) }?;
+        let device_memory = unsafe { ctx.device.allocate_memory(&allocate_info, None) }?;
         debug!(
             "Allocated 0x{:x} bytes @ 0x{:x}",
             allocate_info.allocation_size,
             device_memory.as_raw()
         );
 
-        unsafe { device.bind_buffer_memory(inner, device_memory, 0) }?;
+        unsafe { ctx.device.bind_buffer_memory(inner, device_memory, 0) }?;
 
         Ok(Self {
+            ctx,
             inner,
-            device,
             device_memory,
         })
     }
@@ -74,7 +72,7 @@ impl<'a> Buffer<'a> {
 
     pub fn device_address(&self) -> u64 {
         let address_info = vk::BufferDeviceAddressInfo::default().buffer(self.inner);
-        unsafe { self.device.get_buffer_device_address(&address_info) }
+        unsafe { self.ctx.device.get_buffer_device_address(&address_info) }
     }
 
     pub fn store<T: Copy>(&mut self, data: &[T]) {
@@ -91,6 +89,7 @@ impl<'a> Buffer<'a> {
         unsafe {
             let size = (std::mem::size_of::<T>() * element_count) as u64;
             let mapped_ptr = self
+                .ctx
                 .device
                 .map_memory(self.device_memory, 0, size, vk::MemoryMapFlags::empty())
                 .expect("Failed to map memory") as *const T;
@@ -98,7 +97,7 @@ impl<'a> Buffer<'a> {
             let slice = std::slice::from_raw_parts(mapped_ptr, element_count);
             let result = slice.to_vec();
 
-            self.device.unmap_memory(self.device_memory);
+            self.ctx.device.unmap_memory(self.device_memory);
 
             result
         }
@@ -107,6 +106,7 @@ impl<'a> Buffer<'a> {
     fn map(&mut self, size: vk::DeviceSize) -> *mut c_void {
         unsafe {
             let data: *mut std::ffi::c_void = self
+                .ctx
                 .device
                 .map_memory(self.device_memory, 0, size, vk::MemoryMapFlags::empty())
                 .unwrap();
@@ -116,14 +116,20 @@ impl<'a> Buffer<'a> {
 
     fn unmap(&mut self) {
         unsafe {
-            self.device.unmap_memory(self.device_memory);
+            self.ctx.device.unmap_memory(self.device_memory);
         }
     }
 
-    pub fn destroy(self) {
+    pub fn destroy(&self) {
         unsafe {
-            self.device.destroy_buffer(self.inner, None);
-            self.device.free_memory(self.device_memory, None);
+            self.ctx.device.destroy_buffer(self.inner, None);
+            self.ctx.device.free_memory(self.device_memory, None);
         }
+    }
+}
+
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.destroy();
     }
 }
