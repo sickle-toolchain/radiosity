@@ -428,16 +428,6 @@ fn run() -> Result<()> {
         .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
         .map_err(|_| anyhow!("Failed to get vertices lump"))?;
 
-    let mut vertex_buffer = Buffer::new(
-        ctx.clone(),
-        (size_of::<Vertex>() * vertices.len()) as u64,
-        vk::BufferUsageFlags::VERTEX_BUFFER
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
-    vertex_buffer.store(&vertices);
-
     let faces = bsp
         .lump_cast::<[Face], _>(LumpDefinition::Faces)
         .map_err(|_| anyhow!("Failed to get faces lump"))?;
