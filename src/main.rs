@@ -102,19 +102,19 @@ impl Application<'_> {
 
         let mut vertex_buffer = Buffer::new(
             self.ctx.clone(),
-            (size_of::<Vertex>() * vertices.len()) as u64,
+            size_of_val(vertices) as u64,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::VERTEX_BUFFER,
             MEMORY_PROPERTYIES,
         )?;
-        vertex_buffer.store(&vertices);
+        vertex_buffer.store(vertices);
 
         let mut index_buffer = Buffer::new(
             self.ctx.clone(),
-            (size_of::<I>() * indices.len()) as u64,
+            size_of_val(indices) as u64,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::INDEX_BUFFER,
             MEMORY_PROPERTYIES,
         )?;
-        index_buffer.store(&indices);
+        index_buffer.store(indices);
 
         let geometry = vk::AccelerationStructureGeometryKHR::default()
             .geometry_type(vk::GeometryTypeKHR::TRIANGLES)
