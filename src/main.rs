@@ -35,14 +35,6 @@ use shared::{AlignedVec3, TexelData};
 
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
 
-pub struct Application<'a> {
-    pub ctx: Rc<VulkanContext>,
-    pub acceleration_structure_device: acceleration_structure::Device,
-    pub ray_tracing_pipeline_device: ray_tracing_pipeline::Device,
-    pub ray_tracing_pipeline_properties: PhysicalDeviceRayTracingPipelinePropertiesKHR<'a>,
-    pub timestamp_query_pool: QueryPool,
-}
-
 fn format_duration_ms(ms: f64) -> String {
     let mut remaining_ms = ms.max(0.0);
     let hours = (remaining_ms / 3_600_000.0).floor() as u64;
@@ -70,6 +62,28 @@ fn format_duration_ms(ms: f64) -> String {
     }
 
     parts.join(" ")
+}
+
+pub struct Application<'a> {
+    pub ctx: Rc<VulkanContext>,
+    pub acceleration_structure_device: acceleration_structure::Device,
+    pub ray_tracing_pipeline_device: ray_tracing_pipeline::Device,
+    pub ray_tracing_pipeline_properties: PhysicalDeviceRayTracingPipelinePropertiesKHR<'a>,
+
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_pool: vk::DescriptorPool,
+    pub descriptor_set: vk::DescriptorSet,
+
+    pub blas: AccelerationStructureKHR,
+    pub tlas_buffer: Option<Buffer>,
+    pub tlas: AccelerationStructureKHR,
+    pub blas_buffer: Option<Buffer>,
+
+    pub pipeline_layout: vk::PipelineLayout,
+    pub pipeline: vk::Pipeline,
+    pub shader_binding_table_buffer: Option<Buffer>,
+
+    pub timestamp_query_pool: QueryPool,
 }
 
 impl Application<'_> {
@@ -108,6 +122,16 @@ impl Application<'_> {
             ray_tracing_pipeline_device,
             ray_tracing_pipeline_properties,
             timestamp_query_pool,
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_set: vk::DescriptorSet::null(),
+            blas: AccelerationStructureKHR::null(),
+            blas_buffer: None,
+            tlas: AccelerationStructureKHR::null(),
+            tlas_buffer: None,
+            pipeline_layout: vk::PipelineLayout::null(),
+            pipeline: vk::Pipeline::null(),
+            shader_binding_table_buffer: None,
         })
     }
 
@@ -207,7 +231,7 @@ impl Application<'_> {
                     .index_data(vk::DeviceOrHostAddressConstKHR {
                         device_address: index_buffer.device_address(),
                     })
-                    .index_type(vk::IndexType::UINT16),
+                    .index_type(I::vk_index_type()),
             })
             .flags(vk::GeometryFlagsKHR::OPAQUE);
 
@@ -322,7 +346,7 @@ impl Application<'_> {
 
         let scratch_buffer = Buffer::new(
             self.ctx.clone(),
-            sizes_info.acceleration_structure_size,
+            sizes_info.build_scratch_size,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
@@ -338,19 +362,16 @@ impl Application<'_> {
                 .level(vk::CommandBufferLevel::PRIMARY);
 
             let command_buffers =
-                unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }.unwrap();
+                unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }?;
             command_buffers[0]
         };
 
         unsafe {
-            self.ctx
-                .device
-                .begin_command_buffer(
-                    build_command_buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .unwrap();
+            self.ctx.device.begin_command_buffer(
+                build_command_buffer,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )?;
 
             self.begin_timestamp_range(
                 build_command_buffer,
@@ -368,17 +389,14 @@ impl Application<'_> {
                 build_command_buffer,
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
             );
-            self.ctx
-                .device
-                .end_command_buffer(build_command_buffer)
-                .unwrap();
+            self.ctx.device.end_command_buffer(build_command_buffer)?;
             self.ctx.device.queue_submit(
                 self.ctx.queue,
                 &[vk::SubmitInfo::default().command_buffers(&[build_command_buffer])],
                 vk::Fence::null(),
             )?;
 
-            self.ctx.device.queue_wait_idle(self.ctx.queue).unwrap();
+            self.ctx.device.queue_wait_idle(self.ctx.queue)?;
             self.ctx
                 .device
                 .free_command_buffers(self.ctx.pool, &[build_command_buffer]);
@@ -392,11 +410,436 @@ impl Application<'_> {
 
         Ok((acceleration_structure, buffer))
     }
+
+    pub fn create_acceleration_structures<I>(
+        &mut self,
+        vertices: &[Vertex],
+        indices: &[I],
+    ) -> Result<()>
+    where
+        I: GeometryIndex + Copy,
+    {
+        let (blas_geometry, _vertex_buffer, _index_buffer) =
+            self.create_triangle_geometry(vertices, indices)?;
+        let (blas, blas_buffer) = self.create_as(
+            AccelerationStructureTypeKHR::BOTTOM_LEVEL,
+            &[blas_geometry],
+            &[vk::AccelerationStructureBuildRangeInfoKHR::default()
+                .primitive_count(indices.len() as u32 / 3)],
+            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
+        )?;
+
+        let identity_matrix: [f32; 12] = std::array::from_fn(|i| Mat4::IDENTITY.to_cols_array()[i]);
+        let (tlas_geometry, _tlas_geometry_buffer) =
+            self.create_instance_geometry(blas, identity_matrix)?;
+
+        let (tlas, tlas_buffer) = self.create_as(
+            AccelerationStructureTypeKHR::TOP_LEVEL,
+            &[tlas_geometry],
+            &[vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1)],
+            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
+        )?;
+
+        self.blas = blas;
+        self.blas_buffer = Some(blas_buffer);
+        self.tlas = tlas;
+        self.tlas_buffer = Some(tlas_buffer);
+        Ok(())
+    }
+
+    pub fn create_pipeline(&mut self) -> Result<usize> {
+        let binding_flags_inner = [
+            vk::DescriptorBindingFlagsEXT::empty(),
+            vk::DescriptorBindingFlagsEXT::empty(),
+            vk::DescriptorBindingFlagsEXT::empty(),
+        ];
+
+        let mut binding_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
+            .binding_flags(&binding_flags_inner);
+
+        let descriptor_set_layout = unsafe {
+            self.ctx.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .bindings(&[
+                        vk::DescriptorSetLayoutBinding::default()
+                            .descriptor_count(1)
+                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+                            .binding(0),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(1)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(2)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                    ])
+                    .push_next(&mut binding_flags),
+                None,
+            )
+        }?;
+
+        let shader_module_create_info = vk::ShaderModuleCreateInfo {
+            s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
+            p_next: ptr::null(),
+            flags: vk::ShaderModuleCreateFlags::empty(),
+            code_size: SHADER.len(),
+            p_code: SHADER.as_ptr().cast::<u32>(),
+            ..Default::default()
+        };
+
+        let shader_module = unsafe {
+            self.ctx
+                .device
+                .create_shader_module(&shader_module_create_info, None)
+        }?;
+
+        let layouts = vec![descriptor_set_layout];
+        let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
+
+        let pipeline_layout = unsafe {
+            self.ctx
+                .device
+                .create_pipeline_layout(&layout_create_info, None)
+        }?;
+
+        let shader_groups = vec![
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(0)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                .general_shader(vk::SHADER_UNUSED_KHR)
+                .closest_hit_shader(1)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(2)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR),
+        ];
+
+        let shader_stages = vec![
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
+                .module(shader_module)
+                .name(c"ray_generation"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
+                .module(shader_module)
+                .name(c"closest_hit"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::MISS_KHR)
+                .module(shader_module)
+                .name(c"miss"),
+        ];
+
+        let pipeline = unsafe {
+            self.ray_tracing_pipeline_device
+                .create_ray_tracing_pipelines(
+                    vk::DeferredOperationKHR::null(),
+                    vk::PipelineCache::null(),
+                    &[vk::RayTracingPipelineCreateInfoKHR::default()
+                        .stages(&shader_stages)
+                        .groups(&shader_groups)
+                        .max_pipeline_ray_recursion_depth(1)
+                        .layout(pipeline_layout)],
+                    None,
+                )
+        }
+        .map_err(|(_, result)| result)?[0];
+
+        unsafe {
+            self.ctx.device.destroy_shader_module(shader_module, None);
+        }
+
+        self.descriptor_set_layout = descriptor_set_layout;
+        self.pipeline_layout = pipeline_layout;
+        self.pipeline = pipeline;
+
+        Ok(shader_groups.len())
+    }
+
+    pub fn create_shader_binding_table(&mut self, shader_group_count: usize) -> Result<u64> {
+        let pipeline = self.pipeline;
+        let handle_size = self
+            .ray_tracing_pipeline_properties
+            .shader_group_handle_size as usize;
+        let handle_alignment = self
+            .ray_tracing_pipeline_properties
+            .shader_group_base_alignment as usize;
+        let handle_size_aligned = (handle_size + handle_alignment - 1) & !(handle_alignment - 1);
+
+        let incoming_table_data = unsafe {
+            self.ray_tracing_pipeline_device
+                .get_ray_tracing_shader_group_handles(
+                    pipeline,
+                    0,
+                    shader_group_count as u32,
+                    shader_group_count * handle_size,
+                )
+        }?;
+
+        let table_size = shader_group_count * handle_size_aligned;
+        let mut table_data = vec![0u8; table_size];
+
+        for i in 0..shader_group_count {
+            let src = i * handle_size;
+            let dst = i * handle_size_aligned;
+            table_data[dst..dst + handle_size]
+                .copy_from_slice(&incoming_table_data[src..src + handle_size]);
+        }
+
+        let mut shader_binding_table_buffer = Buffer::new(
+            self.ctx.clone(),
+            table_size as u64,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+
+        shader_binding_table_buffer.store(&table_data);
+
+        self.shader_binding_table_buffer = Some(shader_binding_table_buffer);
+
+        Ok(handle_size_aligned as u64)
+    }
+
+    pub fn create_descriptor_set(
+        &mut self,
+        texel_buffer: &Buffer,
+        lighting_buffer: &Buffer,
+    ) -> Result<()> {
+        let descriptor_set_layout = self.descriptor_set_layout;
+        let tlas = self.tlas;
+
+        let descriptor_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+            descriptor_count: 1,
+        }];
+
+        let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&descriptor_sizes)
+            .max_sets(1);
+
+        let descriptor_pool = unsafe {
+            self.ctx
+                .device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+        }?;
+
+        let mut count_allocate_info =
+            vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&[1]);
+
+        let descriptor_set = unsafe {
+            self.ctx.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&[descriptor_set_layout])
+                    .push_next(&mut count_allocate_info),
+            )
+        }?[0];
+
+        let accel_structs = [tlas];
+        let mut accel_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
+            .acceleration_structures(&accel_structs);
+
+        let accel_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+            .push_next(&mut accel_info)
+            .descriptor_count(1);
+
+        let texel_info = [vk::DescriptorBufferInfo::default()
+            .buffer(texel_buffer.handle())
+            .range(vk::WHOLE_SIZE)];
+
+        let texel_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(1)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&texel_info)
+            .descriptor_count(1);
+
+        let lighting_info = [vk::DescriptorBufferInfo::default()
+            .buffer(lighting_buffer.handle())
+            .range(vk::WHOLE_SIZE)];
+
+        let lighting_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(2)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&lighting_info)
+            .descriptor_count(1);
+
+        unsafe {
+            self.ctx
+                .device
+                .update_descriptor_sets(&[accel_write, texel_write, lighting_write], &[]);
+        }
+
+        self.descriptor_pool = descriptor_pool;
+        self.descriptor_set = descriptor_set;
+
+        Ok(())
+    }
+
+    pub fn record_ray_tracing(
+        &self,
+        sbt_handle_size: u64,
+        texel_count: usize,
+        lighting_buffer: &Buffer,
+    ) -> Result<()> {
+        debug_assert!(self.pipeline != vk::Pipeline::null());
+        debug_assert!(self.pipeline_layout != vk::PipelineLayout::null());
+        debug_assert!(self.descriptor_set != vk::DescriptorSet::null());
+
+        let sbt_buffer = self
+            .shader_binding_table_buffer
+            .as_ref()
+            .context("SBT buffer not created")?;
+
+        let command_buffer = {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(1)
+                .command_pool(self.ctx.pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            unsafe { self.ctx.device.allocate_command_buffers(&info) }?[0]
+        };
+
+        {
+            let begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
+            unsafe {
+                self.ctx
+                    .device
+                    .begin_command_buffer(command_buffer, &begin_info)
+            }?;
+        }
+
+        let sbt_address = sbt_buffer.device_address();
+        let sbt_raygen_region = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt_address)
+            .size(sbt_handle_size)
+            .stride(sbt_handle_size);
+        let sbt_hit_region = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt_address + sbt_handle_size)
+            .size(sbt_handle_size)
+            .stride(sbt_handle_size);
+        let sbt_miss_region = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt_address + 2 * sbt_handle_size)
+            .size(sbt_handle_size)
+            .stride(sbt_handle_size);
+        let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
+
+        unsafe {
+            self.ctx.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                self.pipeline,
+            );
+            self.ctx.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_set],
+                &[],
+            );
+
+            self.begin_timestamp_range(
+                command_buffer,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            );
+
+            self.ray_tracing_pipeline_device.cmd_trace_rays(
+                command_buffer,
+                &sbt_raygen_region,
+                &sbt_miss_region,
+                &sbt_hit_region,
+                &sbt_call_region,
+                texel_count as u32,
+                1,
+                1,
+            );
+
+            self.end_timestamp_range(
+                command_buffer,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            );
+
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(lighting_buffer.handle())
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+
+            self.ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::PipelineStageFlags::HOST,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier],
+                &[],
+            );
+
+            self.ctx.device.end_command_buffer(command_buffer)?;
+
+            self.ctx.device.queue_submit(
+                self.ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                vk::Fence::null(),
+            )?;
+            self.ctx.device.queue_wait_idle(self.ctx.queue)?;
+        }
+
+        info!(
+            "Ray-tracing shader executed in {}",
+            format_duration_ms(self.read_timestamp_ms()?)
+        );
+        Ok(())
+    }
 }
 
 impl Drop for Application<'_> {
     fn drop(&mut self) {
         unsafe {
+            self.ctx.device.destroy_pipeline(self.pipeline, None);
+
+            self.ctx
+                .device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+
+            self.ctx
+                .device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+
+            self.ctx
+                .device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
+
+            self.acceleration_structure_device
+                .destroy_acceleration_structure(self.tlas, None);
+
+            self.acceleration_structure_device
+                .destroy_acceleration_structure(self.blas, None);
             self.ctx
                 .device
                 .destroy_query_pool(self.timestamp_query_pool, None);
@@ -481,7 +924,7 @@ fn run() -> Result<()> {
         &device_layers,
         args.device_id,
     )?);
-    let app = Application::new(ctx.clone())?;
+    let mut app = Application::new(ctx.clone())?;
 
     let vertices = bsp
         .lump_cast::<[Vertex], _>(LumpDefinition::Vertices)
@@ -515,69 +958,69 @@ fn run() -> Result<()> {
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-
     texel_buffer.store(&texels);
 
-    let mut lighting_buffer = Buffer::new(
+    let lighting_buffer = Buffer::new(
         ctx.clone(),
         (size_of::<AlignedVec3>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    lighting_buffer.store(vec![AlignedVec3::default(); texels.len()].as_slice());
 
-    let texture_info_lump = bsp
-        .lump_cast::<[TextureInfo], _>(LumpDefinition::TextureInfo)
-        .map_err(|_| anyhow!("Failed to get texture info lump"))?;
-    let texture_data_lump = bsp
-        .lump_cast::<[TextureData], _>(LumpDefinition::TextureData)
-        .map_err(|_| anyhow!("Failed to get texture data lump"))?;
-    let texture_data_string_table = bsp
-        .lump_cast::<[u32], _>(LumpDefinition::TextureDataStringTable)
-        .map_err(|_| anyhow!("Failed to get texture data string table lump"))?;
-    let texture_data_string_data = bsp
-        .lump_cast::<[u8], _>(LumpDefinition::TextureDataStringData)
-        .map_err(|_| anyhow!("Failed to get texture data string data lump"))?;
+    let indices = {
+        let texture_info_lump = bsp
+            .lump_cast::<[TextureInfo], _>(LumpDefinition::TextureInfo)
+            .map_err(|_| anyhow!("Failed to get texture info lump"))?;
+        let texture_data_lump = bsp
+            .lump_cast::<[TextureData], _>(LumpDefinition::TextureData)
+            .map_err(|_| anyhow!("Failed to get texture data lump"))?;
+        let texture_data_string_table = bsp
+            .lump_cast::<[u32], _>(LumpDefinition::TextureDataStringTable)
+            .map_err(|_| anyhow!("Failed to get texture data string table lump"))?;
+        let texture_data_string_data = bsp
+            .lump_cast::<[u8], _>(LumpDefinition::TextureDataStringData)
+            .map_err(|_| anyhow!("Failed to get texture data string data lump"))?;
 
-    let index_capacity = faces
-        .iter()
-        .map(|face| {
+        let capacity = faces
+            .iter()
+            .map(|face| {
+                let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
+                // n edges produces (n - 2) triangles, each triangle has 3 indices
+                let triangle_count = surface_edges.len().saturating_sub(2);
+                triangle_count * 3
+            })
+            .sum();
+
+        let mut indices = Vec::with_capacity(capacity);
+        for face in faces.iter() {
+            let texture_data_idx =
+                texture_info_lump[face.texture_info_index as usize].texture_data_index;
+            let table_idx = texture_data_lump[texture_data_idx as usize].name_index;
+            let data_idx = texture_data_string_table[table_idx as usize];
+            let texture_name =
+                CStr::from_bytes_until_nul(&texture_data_string_data[data_idx as usize..])?
+                    .to_string_lossy();
+            if texture_name.eq_ignore_ascii_case("TOOLS/TOOLSSKYBOX") {
+                continue;
+            }
+
             let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
-            // n edges produces (n - 2) triangles, each triangle has 3 indices
-            let triangle_count = surface_edges.len().saturating_sub(2);
-            triangle_count * 3
-        })
-        .sum();
 
-    let mut indices = Vec::with_capacity(index_capacity);
-    for face in faces.iter() {
-        let texture_data_idx =
-            texture_info_lump[face.texture_info_index as usize].texture_data_index;
-        let table_idx = texture_data_lump[texture_data_idx as usize].name_index;
-        let data_idx = texture_data_string_table[table_idx as usize];
-        let texture_name =
-            CStr::from_bytes_until_nul(&texture_data_string_data[data_idx as usize..])
-                .unwrap()
-                .to_string_lossy();
-        if texture_name.eq_ignore_ascii_case("TOOLS/TOOLSSKYBOX") {
-            continue;
+            let mut it = surface_edges.iter().map(|surface_edge| {
+                <SurfaceEdge as Associated<Edge>>::associated(surface_edge, &bsp).edge
+                    [usize::from(surface_edge.edge_index < 0)]
+            });
+
+            let Some(pivot) = it.next() else { continue };
+            let Some(mut prev) = it.next() else { continue };
+
+            for current in it {
+                indices.extend([pivot, prev, current]);
+                prev = current;
+            }
         }
-
-        let surface_edges = <Face as Associated<[SurfaceEdge]>>::associated(face, &bsp);
-
-        let mut it = surface_edges.iter().map(|surface_edge| {
-            <SurfaceEdge as Associated<Edge>>::associated(surface_edge, &bsp).edge
-                [usize::from(surface_edge.edge_index < 0)]
-        });
-
-        let Some(pivot) = it.next() else { continue };
-        let Some(mut prev) = it.next() else { continue };
-
-        for current in it {
-            indices.extend([pivot, prev, current]);
-            prev = current;
-        }
-    }
+        indices
+    };
 
     if let Some(obj_path) = &args.dump_blas_geometry {
         let mut obj_file = File::create(obj_path).context("Failed to create OBJ file")?;
@@ -606,380 +1049,19 @@ fn run() -> Result<()> {
         info!("Dumped BLAS geometry to {}", obj_path.display());
     }
 
-    let (blas_geometry, _vertex_buffer, _index_buffer) =
-        app.create_triangle_geometry(&vertices, &indices)?;
-    let (blas, _blas_buffer) = app.create_as(
-        AccelerationStructureTypeKHR::BOTTOM_LEVEL,
-        &[blas_geometry],
-        &[vk::AccelerationStructureBuildRangeInfoKHR::default()
-            .primitive_count(indices.len() as u32 / 3)],
-        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
-    )?;
+    app.create_acceleration_structures(&vertices, &indices)?;
 
-    let identity_matrix: [f32; 12] = std::array::from_fn(|i| Mat4::IDENTITY.to_cols_array()[i]);
-    let (tlas_geometry, _tlas_geometry_buffer) =
-        app.create_instance_geometry(blas, identity_matrix)?;
+    let shader_group_count = app.create_pipeline()?;
+    let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
 
-    let (tlas, _tlas_buffer) = app.create_as(
-        AccelerationStructureTypeKHR::TOP_LEVEL,
-        &[tlas_geometry],
-        &[vk::AccelerationStructureBuildRangeInfoKHR::default().primitive_count(1)],
-        vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
-    )?;
-
-    let (descriptor_set_layout, graphics_pipeline, pipeline_layout, shader_group_count) = {
-        let binding_flags_inner = [
-            vk::DescriptorBindingFlagsEXT::empty(),
-            vk::DescriptorBindingFlagsEXT::empty(),
-            vk::DescriptorBindingFlagsEXT::empty(),
-        ];
-
-        let mut binding_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
-            .binding_flags(&binding_flags_inner);
-
-        let descriptor_set_layout = unsafe {
-            ctx.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(&[
-                        vk::DescriptorSetLayoutBinding::default()
-                            .descriptor_count(1)
-                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
-                            .binding(0),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(1)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(2)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    ])
-                    .push_next(&mut binding_flags),
-                None,
-            )
-        }?;
-
-        let shader_module_create_info = vk::ShaderModuleCreateInfo {
-            s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
-            p_next: ptr::null(),
-            flags: vk::ShaderModuleCreateFlags::empty(),
-            code_size: SHADER.len(),
-            p_code: SHADER.as_ptr().cast::<u32>(),
-            ..Default::default()
-        };
-
-        let shader_module = unsafe {
-            ctx.device
-                .create_shader_module(&shader_module_create_info, None)
-        }?;
-
-        let layouts = vec![descriptor_set_layout];
-        let layout_create_info = vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts);
-
-        let pipeline_layout =
-            unsafe { ctx.device.create_pipeline_layout(&layout_create_info, None) }?;
-
-        let shader_groups = vec![
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(0)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(1)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(2)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-        ];
-
-        let shader_stages = vec![
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                .module(shader_module)
-                .name(c"ray_generation"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                .module(shader_module)
-                .name(c"closest_hit"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MISS_KHR)
-                .module(shader_module)
-                .name(c"miss"),
-        ];
-
-        let pipeline = unsafe {
-            app.ray_tracing_pipeline_device
-                .create_ray_tracing_pipelines(
-                    vk::DeferredOperationKHR::null(),
-                    vk::PipelineCache::null(),
-                    &[vk::RayTracingPipelineCreateInfoKHR::default()
-                        .stages(&shader_stages)
-                        .groups(&shader_groups)
-                        .max_pipeline_ray_recursion_depth(1)
-                        .layout(pipeline_layout)],
-                    None,
-                )
-        }
-        .map_err(|(_, result)| result)?[0];
-
-        unsafe {
-            ctx.device.destroy_shader_module(shader_module, None);
-        }
-
-        (
-            descriptor_set_layout,
-            pipeline,
-            pipeline_layout,
-            shader_groups.len(),
-        )
-    };
-
-    let command_buffer = {
-        let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_buffer_count(1)
-            .command_pool(ctx.pool)
-            .level(vk::CommandBufferLevel::PRIMARY);
-
-        unsafe {
-            ctx.device
-                .allocate_command_buffers(&command_buffer_allocate_info)
-        }?[0]
-    };
-
-    {
-        let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
-
-        unsafe {
-            ctx.device
-                .begin_command_buffer(command_buffer, &command_buffer_begin_info)
-        }?;
-    }
-
-    let handle_size = app.ray_tracing_pipeline_properties.shader_group_handle_size as usize;
-    let handle_alignment = app
-        .ray_tracing_pipeline_properties
-        .shader_group_base_alignment as usize;
-
-    let handle_size_aligned = (handle_size + handle_alignment - 1) & !(handle_alignment - 1);
-
-    let shader_binding_table_buffer = {
-        let incoming_table_data = unsafe {
-            app.ray_tracing_pipeline_device
-                .get_ray_tracing_shader_group_handles(
-                    graphics_pipeline,
-                    0,
-                    shader_group_count as u32,
-                    shader_group_count * handle_size,
-                )
-        }?;
-
-        let table_size = shader_group_count * handle_size_aligned;
-        let mut table_data = vec![0u8; table_size];
-
-        for i in 0..shader_group_count {
-            let src = i * handle_size;
-            let dst = i * handle_size_aligned;
-
-            table_data[dst..dst + handle_size]
-                .copy_from_slice(&incoming_table_data[src..src + handle_size]);
-        }
-
-        let mut shader_binding_table_buffer = Buffer::new(
-            ctx.clone(),
-            table_size as u64,
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
-        shader_binding_table_buffer.store(&table_data);
-
-        shader_binding_table_buffer
-    };
-
-    let descriptor_sizes = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
-        descriptor_count: 1,
-    }];
-
-    let descriptor_pool_info = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(&descriptor_sizes)
-        .max_sets(1);
-
-    let descriptor_pool = unsafe {
-        ctx.device
-            .create_descriptor_pool(&descriptor_pool_info, None)
-    }?;
-
-    let mut count_allocate_info =
-        vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&[1]);
-
-    let descriptor_set = unsafe {
-        ctx.device.allocate_descriptor_sets(
-            &vk::DescriptorSetAllocateInfo::default()
-                .descriptor_pool(descriptor_pool)
-                .set_layouts(&[descriptor_set_layout])
-                .push_next(&mut count_allocate_info),
-        )
-    }?[0];
-
-    let accel_structs = [tlas];
-    let mut accel_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
-        .acceleration_structures(&accel_structs);
-
-    let accel_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(0)
-        .dst_array_element(0)
-        .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-        .push_next(&mut accel_info)
-        .descriptor_count(1);
-
-    let texel_info = [vk::DescriptorBufferInfo::default()
-        .buffer(texel_buffer.handle())
-        .range(vk::WHOLE_SIZE)];
-
-    let texel_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(1)
-        .dst_array_element(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&texel_info)
-        .descriptor_count(1);
-
-    let lighting_info = [vk::DescriptorBufferInfo::default()
-        .buffer(lighting_buffer.handle())
-        .range(vk::WHOLE_SIZE)];
-
-    let lighting_write = vk::WriteDescriptorSet::default()
-        .dst_set(descriptor_set)
-        .dst_binding(2)
-        .dst_array_element(0)
-        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-        .buffer_info(&lighting_info)
-        .descriptor_count(1);
-
-    unsafe {
-        ctx.device
-            .update_descriptor_sets(&[accel_write, texel_write, lighting_write], &[]);
-    }
-
-    {
-        let sbt_address = shader_binding_table_buffer.device_address();
-
-        let handle_size_aligned = handle_size_aligned as u64;
-        let sbt_raygen_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address)
-            .size(handle_size_aligned)
-            .stride(handle_size_aligned);
-
-        let sbt_hit_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + handle_size_aligned)
-            .size(handle_size_aligned)
-            .stride(handle_size_aligned);
-
-        let sbt_miss_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + 2 * handle_size_aligned)
-            .size(handle_size_aligned)
-            .stride(handle_size_aligned);
-
-        let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
-
-        unsafe {
-            ctx.device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                graphics_pipeline,
-            );
-            ctx.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                pipeline_layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-
-            app.begin_timestamp_range(
-                command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-            );
-
-            app.ray_tracing_pipeline_device.cmd_trace_rays(
-                command_buffer,
-                &sbt_raygen_region,
-                &sbt_miss_region,
-                &sbt_hit_region,
-                &sbt_call_region,
-                texels.len() as u32,
-                1,
-                1,
-            );
-
-            app.end_timestamp_range(
-                command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-            );
-
-            let barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(lighting_buffer.handle())
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
-
-            ctx.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[barrier],
-                &[],
-            );
-
-            ctx.device.end_command_buffer(command_buffer)?;
-        }
-    }
-
-    unsafe {
-        ctx.device
-            .queue_submit(
-                ctx.queue,
-                &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-                vk::Fence::null(),
-            )
-            .context("Failed to execute queue submit.")?;
-
-        ctx.device.queue_wait_idle(ctx.queue)?;
-    }
-
-    info!(
-        "Radiosity shader executed in {}",
-        format_duration_ms(app.read_timestamp_ms()?)
-    );
+    app.create_descriptor_set(&texel_buffer, &lighting_buffer)?;
+    app.record_ray_tracing(sbt_handle_size, texels.len(), &lighting_buffer)?;
 
     let lighting: Vec<AlignedVec3> = lighting_buffer.load(texels.len());
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
 
     // Drop immutable ref so we can take mutable ref
     drop(faces);
-
     let mut faces = bsp
         .lump_cast_mut::<[Face], _>(LumpDefinition::Faces)
         .map_err(|_| anyhow!("Failed to get faces lump"))?;
@@ -1015,26 +1097,9 @@ fn run() -> Result<()> {
     bsp.write_to_io(&mut File::create("out_radiosity.bsp")?)
         .context("writing to io failed")?;
 
-    unsafe {
-        ctx.device.destroy_pipeline(graphics_pipeline, None);
-        ctx.device.destroy_pipeline_layout(pipeline_layout, None);
-        ctx.device
-            .destroy_descriptor_set_layout(descriptor_set_layout, None);
-        ctx.device.destroy_descriptor_pool(descriptor_pool, None);
-    }
-
-    unsafe {
-        app.acceleration_structure_device
-            .destroy_acceleration_structure(blas, None);
-    }
-
-    unsafe {
-        app.acceleration_structure_device
-            .destroy_acceleration_structure(tlas, None);
-    }
-
     Ok(())
 }
+
 fn main() {
     env_logger::builder()
         .filter_level(LevelFilter::Warn)
