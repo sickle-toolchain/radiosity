@@ -904,6 +904,10 @@ struct Args {
     /// Path to BSP file
     bsp_path: PathBuf,
 
+    /// Output BSP path
+    #[arg(long, value_name = "PATH")]
+    output: PathBuf,
+
     /// Use high dynamic range lumps
     #[arg(help_heading = "bsp", long)]
     hdr: bool,
@@ -1169,7 +1173,7 @@ fn run() -> Result<()> {
     drop(faces);
     drop(lighting_lump);
 
-    bsp.write_to_io(&mut File::create("out_radiosity.bsp")?)
+    bsp.write_to_io(&mut File::create(&args.output)?)
         .context("writing to io failed")?;
 
     Ok(())
