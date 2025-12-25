@@ -75,13 +75,15 @@ pub struct Application<'a> {
     pub descriptor_set: vk::DescriptorSet,
 
     pub blas: AccelerationStructureKHR,
-    pub tlas_buffer: Option<Buffer>,
-    pub tlas: AccelerationStructureKHR,
     pub blas_buffer: Option<Buffer>,
+    pub tlas: AccelerationStructureKHR,
+    pub tlas_buffer: Option<Buffer>,
 
     pub pipeline_layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
     pub shader_binding_table_buffer: Option<Buffer>,
+
+    pub command_buffer: vk::CommandBuffer,
 
     pub timestamp_query_pool: QueryPool,
 }
@@ -116,6 +118,14 @@ impl Application<'_> {
                 .create_query_pool(&timestamp_query_pool_info, None)?
         };
 
+        let command_buffer = {
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(1)
+                .command_pool(ctx.pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+            unsafe { ctx.device.allocate_command_buffers(&info) }?[0]
+        };
+
         Ok(Self {
             ctx,
             acceleration_structure_device,
@@ -132,6 +142,7 @@ impl Application<'_> {
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             shader_binding_table_buffer: None,
+            command_buffer,
         })
     }
 
@@ -701,7 +712,8 @@ impl Application<'_> {
         &self,
         sbt_handle_size: u64,
         texel_count: usize,
-        lighting_buffer: &Buffer,
+        lighting_device: &Buffer,
+        lighting_readback: Option<&Buffer>,
     ) -> Result<()> {
         debug_assert!(self.pipeline != vk::Pipeline::null());
         debug_assert!(self.pipeline_layout != vk::PipelineLayout::null());
@@ -712,22 +724,15 @@ impl Application<'_> {
             .as_ref()
             .context("SBT buffer not created")?;
 
-        let command_buffer = {
-            let info = vk::CommandBufferAllocateInfo::default()
-                .command_buffer_count(1)
-                .command_pool(self.ctx.pool)
-                .level(vk::CommandBufferLevel::PRIMARY);
-            unsafe { self.ctx.device.allocate_command_buffers(&info) }?[0]
-        };
-
-        {
-            let begin_info = vk::CommandBufferBeginInfo::default()
-                .flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE);
-            unsafe {
-                self.ctx
-                    .device
-                    .begin_command_buffer(command_buffer, &begin_info)
-            }?;
+        let begin_info = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        unsafe {
+            self.ctx
+                .device
+                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
+            self.ctx
+                .device
+                .begin_command_buffer(self.command_buffer, &begin_info)?;
         }
 
         let sbt_address = sbt_buffer.device_address();
@@ -747,12 +752,12 @@ impl Application<'_> {
 
         unsafe {
             self.ctx.device.cmd_bind_pipeline(
-                command_buffer,
+                self.command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline,
             );
             self.ctx.device.cmd_bind_descriptor_sets(
-                command_buffer,
+                self.command_buffer,
                 vk::PipelineBindPoint::RAY_TRACING_KHR,
                 self.pipeline_layout,
                 0,
@@ -761,12 +766,12 @@ impl Application<'_> {
             );
 
             self.begin_timestamp_range(
-                command_buffer,
+                self.command_buffer,
                 vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
             );
 
             self.ray_tracing_pipeline_device.cmd_trace_rays(
-                command_buffer,
+                self.command_buffer,
                 &sbt_raygen_region,
                 &sbt_miss_region,
                 &sbt_hit_region,
@@ -777,34 +782,77 @@ impl Application<'_> {
             );
 
             self.end_timestamp_range(
-                command_buffer,
+                self.command_buffer,
                 vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
             );
 
-            let barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::HOST_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(lighting_buffer.handle())
-                .offset(0)
-                .size(vk::WHOLE_SIZE);
+            if let Some(readback) = lighting_readback {
+                let to_transfer = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(lighting_device.handle())
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[to_transfer],
+                    &[],
+                );
 
-            self.ctx.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[barrier],
-                &[],
-            );
+                self.ctx.device.cmd_copy_buffer(
+                    self.command_buffer,
+                    lighting_device.handle(),
+                    readback.handle(),
+                    &[vk::BufferCopy::default().size(readback.size())],
+                );
 
-            self.ctx.device.end_command_buffer(command_buffer)?;
+                let to_host = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(readback.handle())
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[to_host],
+                    &[],
+                );
+            } else {
+                let to_shader = vk::BufferMemoryBarrier::default()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .buffer(lighting_device.handle())
+                    .offset(0)
+                    .size(vk::WHOLE_SIZE);
+                self.ctx.device.cmd_pipeline_barrier(
+                    self.command_buffer,
+                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[to_shader],
+                    &[],
+                );
+            }
 
+            self.ctx.device.end_command_buffer(self.command_buffer)?;
             self.ctx.device.queue_submit(
                 self.ctx.queue,
-                &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                &[vk::SubmitInfo::default().command_buffers(&[self.command_buffer])],
                 vk::Fence::null(),
             )?;
             self.ctx.device.queue_wait_idle(self.ctx.queue)?;
@@ -840,6 +888,9 @@ impl Drop for Application<'_> {
 
             self.acceleration_structure_device
                 .destroy_acceleration_structure(self.blas, None);
+            self.ctx
+                .device
+                .free_command_buffers(self.ctx.pool, &[self.command_buffer]);
             self.ctx
                 .device
                 .destroy_query_pool(self.timestamp_query_pool, None);
@@ -952,18 +1003,37 @@ fn run() -> Result<()> {
         }
     }
 
-    let mut texel_buffer = Buffer::new(
+    let mut texel_staging = Buffer::new(
         ctx.clone(),
         (size_of::<TexelData>() * texels.len()) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    texel_buffer.store(&texels);
+    texel_staging.store(&texels);
 
-    let lighting_buffer = Buffer::new(
+    let texel_buffer = Buffer::new(
+        ctx.clone(),
+        texel_staging.size(),
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    texel_buffer.copy_from(&texel_staging, texel_staging.size())?;
+
+    let lighting_buffer_device = Buffer::new(
         ctx.clone(),
         (size_of::<AlignedVec3>() * texels.len()) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+
+    let lighting_buffer_readback = Buffer::new(
+        ctx.clone(),
+        lighting_buffer_device.size(),
+        vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
 
@@ -1054,10 +1124,15 @@ fn run() -> Result<()> {
     let shader_group_count = app.create_pipeline()?;
     let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
 
-    app.create_descriptor_set(&texel_buffer, &lighting_buffer)?;
-    app.record_ray_tracing(sbt_handle_size, texels.len(), &lighting_buffer)?;
+    app.create_descriptor_set(&texel_buffer, &lighting_buffer_device)?;
+    app.record_ray_tracing(
+        sbt_handle_size,
+        texels.len(),
+        &lighting_buffer_device,
+        Some(&lighting_buffer_readback),
+    )?;
 
-    let lighting: Vec<AlignedVec3> = lighting_buffer.load(texels.len());
+    let lighting: Vec<AlignedVec3> = lighting_buffer_readback.load(texels.len());
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
 
     // Drop immutable ref so we can take mutable ref

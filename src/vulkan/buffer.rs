@@ -1,3 +1,4 @@
+use anyhow::Result;
 use std::ffi::c_void;
 use std::rc::Rc;
 
@@ -14,6 +15,7 @@ pub struct Buffer {
     pub(crate) ctx: Rc<VulkanContext>,
     pub(crate) inner: vk::Buffer,
     pub(crate) device_memory: vk::DeviceMemory,
+    pub(crate) size: vk::DeviceSize,
 }
 
 impl Buffer {
@@ -63,7 +65,12 @@ impl Buffer {
             ctx,
             inner,
             device_memory,
+            size,
         })
+    }
+
+    pub fn size(&self) -> vk::DeviceSize {
+        self.size
     }
 
     pub fn handle(&self) -> vk::Buffer {
@@ -125,6 +132,44 @@ impl Buffer {
             self.ctx.device.destroy_buffer(self.inner, None);
             self.ctx.device.free_memory(self.device_memory, None);
         }
+    }
+
+    pub fn copy_from(&self, src: &Buffer, size: vk::DeviceSize) -> Result<()> {
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_buffer_count(1)
+            .command_pool(self.ctx.pool)
+            .level(vk::CommandBufferLevel::PRIMARY);
+
+        let command_buffer = unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }?[0];
+
+        let begin = vk::CommandBufferBeginInfo::default()
+            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+
+        unsafe {
+            self.ctx
+                .device
+                .begin_command_buffer(command_buffer, &begin)?;
+            self.ctx.device.cmd_copy_buffer(
+                command_buffer,
+                src.handle(),
+                self.handle(),
+                &[vk::BufferCopy::default().size(size)],
+            );
+            self.ctx.device.end_command_buffer(command_buffer)?;
+
+            self.ctx.device.queue_submit(
+                self.ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                vk::Fence::null(),
+            )?;
+            self.ctx.device.queue_wait_idle(self.ctx.queue)?;
+
+            self.ctx
+                .device
+                .free_command_buffers(self.ctx.pool, &[command_buffer]);
+        }
+
+        Ok(())
     }
 }
 

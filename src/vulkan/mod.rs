@@ -191,10 +191,14 @@ impl VulkanContext {
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
         let pool = {
-            let command_pool_create_info =
-                vk::CommandPoolCreateInfo::default().queue_family_index(queue_family_index);
+            let command_pool_info = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family_index)
+                .flags(
+                    vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER
+                        | vk::CommandPoolCreateFlags::TRANSIENT,
+                );
 
-            unsafe { device.create_command_pool(&command_pool_create_info, None) }
+            unsafe { device.create_command_pool(&command_pool_info, None) }
                 .context("Failed to create command pool")?
         };
 
