@@ -498,7 +498,7 @@ impl Application<'_> {
             p_next: ptr::null(),
             flags: vk::ShaderModuleCreateFlags::empty(),
             code_size: SHADER.len(),
-            p_code: SHADER.as_ptr().cast::<u32>(),
+            p_code: SHADER.as_ptr().cast(),
             ..Default::default()
         };
 
