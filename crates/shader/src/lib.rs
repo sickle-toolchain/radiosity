@@ -79,7 +79,7 @@ pub fn ray_generation(
     let (tangent, bitangent) = tangent_basis(normal);
 
     let mut accumulated = Vec3::ZERO;
-    let samples = 64;
+    let samples = 256;
 
     for _ in 0..samples {
         let local_dir = cosine_hemisphere(&mut seed);

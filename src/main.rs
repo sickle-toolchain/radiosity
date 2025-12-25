@@ -43,6 +43,35 @@ pub struct Application<'a> {
     pub timestamp_query_pool: QueryPool,
 }
 
+fn format_duration_ms(ms: f64) -> String {
+    let mut remaining_ms = ms.max(0.0);
+    let hours = (remaining_ms / 3_600_000.0).floor() as u64;
+    remaining_ms -= hours as f64 * 3_600_000.0;
+
+    let minutes = (remaining_ms / 60_000.0).floor() as u64;
+    remaining_ms -= minutes as f64 * 60_000.0;
+
+    let seconds = (remaining_ms / 1_000.0).floor() as u64;
+    remaining_ms -= seconds as f64 * 1_000.0;
+
+    let mut parts = Vec::new();
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+
+    if seconds > 0 {
+        let total_seconds = seconds as f64 + remaining_ms / 1000.0;
+        parts.push(format!("{total_seconds:.3}s"));
+    } else {
+        parts.push(format!("{remaining_ms:.3}ms"));
+    }
+
+    parts.join(" ")
+}
+
 impl Application<'_> {
     pub fn new(ctx: Rc<VulkanContext>) -> Result<Self> {
         let acceleration_structure_device =
@@ -80,6 +109,55 @@ impl Application<'_> {
             ray_tracing_pipeline_properties,
             timestamp_query_pool,
         })
+    }
+
+    fn begin_timestamp_range(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags,
+    ) {
+        unsafe {
+            self.ctx
+                .device
+                .cmd_reset_query_pool(command_buffer, self.timestamp_query_pool, 0, 2);
+            self.ctx.device.cmd_write_timestamp(
+                command_buffer,
+                stage,
+                self.timestamp_query_pool,
+                0,
+            );
+        }
+    }
+
+    fn end_timestamp_range(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        stage: vk::PipelineStageFlags,
+    ) {
+        unsafe {
+            self.ctx.device.cmd_write_timestamp(
+                command_buffer,
+                stage,
+                self.timestamp_query_pool,
+                1,
+            );
+        }
+    }
+
+    fn read_timestamp_ms(&self) -> Result<f64> {
+        let mut timestamps = [0u64; 2];
+        unsafe {
+            self.ctx.device.get_query_pool_results(
+                self.timestamp_query_pool,
+                0,
+                &mut timestamps,
+                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
+            )?;
+        }
+        let delta_ticks = timestamps[1].saturating_sub(timestamps[0]);
+        let time_ns =
+            delta_ticks as f64 * self.ctx.physical_device_properties.limits.timestamp_period as f64;
+        Ok(time_ns / 1_000_000.0)
     }
 
     // Create triangular acceleration structure geometry
@@ -274,18 +352,9 @@ impl Application<'_> {
                 )
                 .unwrap();
 
-            self.ctx.device.cmd_reset_query_pool(
-                build_command_buffer,
-                self.timestamp_query_pool,
-                0,
-                2,
-            );
-
-            self.ctx.device.cmd_write_timestamp(
+            self.begin_timestamp_range(
                 build_command_buffer,
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                self.timestamp_query_pool,
-                0,
             );
 
             self.acceleration_structure_device
@@ -295,11 +364,9 @@ impl Application<'_> {
                     &[build_range_info],
                 );
 
-            self.ctx.device.cmd_write_timestamp(
+            self.end_timestamp_range(
                 build_command_buffer,
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                self.timestamp_query_pool,
-                1,
             );
             self.ctx
                 .device
@@ -316,24 +383,11 @@ impl Application<'_> {
                 .device
                 .free_command_buffers(self.ctx.pool, &[build_command_buffer]);
         }
-        let mut timestamps = [0u64; 2];
 
-        unsafe {
-            self.ctx.device.get_query_pool_results(
-                self.timestamp_query_pool,
-                0,
-                &mut timestamps,
-                vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
-            )?;
-        }
-
-        let timestamp_period = self.ctx.physical_device_properties.limits.timestamp_period;
-        let delta_ticks = timestamps[1] - timestamps[0];
-        let time_ns = delta_ticks as f64 * timestamp_period as f64;
-
+        let build_time_ms = self.read_timestamp_ms()?;
         info!(
-            "Built {structure_type:#?} acceleration structure in {:.3} ms",
-            time_ns / 1_000_000f64
+            "Built {structure_type:#?} acceleration structure in {}",
+            format_duration_ms(build_time_ms)
         );
 
         Ok((acceleration_structure, buffer))
@@ -859,6 +913,11 @@ fn run() -> Result<()> {
                 &[],
             );
 
+            app.begin_timestamp_range(
+                command_buffer,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            );
+
             app.ray_tracing_pipeline_device.cmd_trace_rays(
                 command_buffer,
                 &sbt_raygen_region,
@@ -868,6 +927,11 @@ fn run() -> Result<()> {
                 texels.len() as u32,
                 1,
                 1,
+            );
+
+            app.end_timestamp_range(
+                command_buffer,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
             );
 
             let barrier = vk::BufferMemoryBarrier::default()
@@ -904,6 +968,11 @@ fn run() -> Result<()> {
 
         ctx.device.queue_wait_idle(ctx.queue)?;
     }
+
+    info!(
+        "Radiosity shader executed in {}",
+        format_duration_ms(app.read_timestamp_ms()?)
+    );
 
     let lighting: Vec<AlignedVec3> = lighting_buffer.load(texels.len());
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
