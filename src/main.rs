@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::ffi::CStr;
 use std::fs::File;
+use std::io::Write;
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
@@ -366,6 +367,10 @@ struct Args {
     /// Force use of specific device id
     #[arg(help_heading = "vulkan", long)]
     device_id: Option<u32>,
+
+    /// Dump BLAS geometry to OBJ file
+    #[arg(help_heading = "vulkan", long, value_name = "PATH")]
+    dump_blas_geometry: Option<PathBuf>,
 }
 
 fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
@@ -518,6 +523,33 @@ fn run() -> Result<()> {
             indices.extend([pivot, prev, current]);
             prev = current;
         }
+    }
+
+    if let Some(obj_path) = &args.dump_blas_geometry {
+        let mut obj_file = File::create(obj_path).context("Failed to create OBJ file")?;
+
+        // Write vertices
+        for vertex in vertices.iter() {
+            writeln!(
+                obj_file,
+                "v {} {} {}",
+                vertex.point[0], vertex.point[1], vertex.point[2]
+            )?;
+        }
+
+        writeln!(obj_file)?;
+
+        for triangle in indices.chunks(3) {
+            writeln!(
+                obj_file,
+                "f {} {} {}",
+                triangle[0] + 1,
+                triangle[1] + 1,
+                triangle[2] + 1
+            )?;
+        }
+
+        info!("Dumped BLAS geometry to {}", obj_path.display());
     }
 
     let (blas_geometry, _vertex_buffer, _index_buffer) =
