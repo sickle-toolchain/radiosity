@@ -208,7 +208,7 @@ impl Application<'_> {
             BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
                 | BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw(),
         );
-        const MEMORY_PROPERTYIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
+        const MEMORY_PROPERTIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
             MemoryPropertyFlags::HOST_VISIBLE.as_raw()
                 | MemoryPropertyFlags::HOST_COHERENT.as_raw(),
         );
@@ -217,7 +217,7 @@ impl Application<'_> {
             self.ctx.clone(),
             size_of_val(vertices) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::VERTEX_BUFFER,
-            MEMORY_PROPERTYIES,
+            MEMORY_PROPERTIES,
         )?;
         vertex_buffer.store(vertices);
 
@@ -225,7 +225,7 @@ impl Application<'_> {
             self.ctx.clone(),
             size_of_val(indices) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::INDEX_BUFFER,
-            MEMORY_PROPERTYIES,
+            MEMORY_PROPERTIES,
         )?;
         index_buffer.store(indices);
 
@@ -259,7 +259,7 @@ impl Application<'_> {
             BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw()
                 | BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR.as_raw(),
         );
-        const MEMORY_PROPERTYIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
+        const MEMORY_PROPERTIES: MemoryPropertyFlags = MemoryPropertyFlags::from_raw(
             MemoryPropertyFlags::HOST_VISIBLE.as_raw()
                 | MemoryPropertyFlags::HOST_COHERENT.as_raw(),
         );
@@ -288,7 +288,7 @@ impl Application<'_> {
             self.ctx.clone(),
             size_of_val(&instances) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS,
-            MEMORY_PROPERTYIES,
+            MEMORY_PROPERTIES,
         )?;
         instance_buffer.store(&instances);
 
