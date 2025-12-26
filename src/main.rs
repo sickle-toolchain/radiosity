@@ -215,7 +215,7 @@ impl Application<'_> {
 
         let mut vertex_buffer = Buffer::new(
             self.ctx.clone(),
-            size_of_val(vertices) as u64,
+            size_of_val(vertices) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::VERTEX_BUFFER,
             MEMORY_PROPERTYIES,
         )?;
@@ -223,7 +223,7 @@ impl Application<'_> {
 
         let mut index_buffer = Buffer::new(
             self.ctx.clone(),
-            size_of_val(indices) as u64,
+            size_of_val(indices) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS | BufferUsageFlags::INDEX_BUFFER,
             MEMORY_PROPERTYIES,
         )?;
@@ -286,7 +286,7 @@ impl Application<'_> {
 
         let mut instance_buffer = Buffer::new(
             self.ctx.clone(),
-            (size_of::<vk::AccelerationStructureInstanceKHR>() * instances.len()) as vk::DeviceSize,
+            size_of_val(&instances) as vk::DeviceSize,
             INPUT_BUFFER_FLAGS,
             MEMORY_PROPERTYIES,
         )?;
