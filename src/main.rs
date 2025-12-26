@@ -580,7 +580,6 @@ impl Application<'_> {
     }
 
     pub fn create_shader_binding_table(&mut self, shader_group_count: usize) -> Result<u64> {
-        let pipeline = self.pipeline;
         let handle_size = self
             .ray_tracing_pipeline_properties
             .shader_group_handle_size as usize;
@@ -592,7 +591,7 @@ impl Application<'_> {
         let incoming_table_data = unsafe {
             self.ray_tracing_pipeline_device
                 .get_ray_tracing_shader_group_handles(
-                    pipeline,
+                    self.pipeline,
                     0,
                     shader_group_count as u32,
                     shader_group_count * handle_size,
@@ -630,9 +629,6 @@ impl Application<'_> {
         texel_buffer: &Buffer,
         lighting_buffer: &Buffer,
     ) -> Result<()> {
-        let descriptor_set_layout = self.descriptor_set_layout;
-        let tlas = self.tlas;
-
         let descriptor_sizes = [vk::DescriptorPoolSize {
             ty: vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
             descriptor_count: 1,
@@ -655,12 +651,12 @@ impl Application<'_> {
             self.ctx.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[descriptor_set_layout])
+                    .set_layouts(&[self.descriptor_set_layout])
                     .push_next(&mut count_allocate_info),
             )
         }?[0];
 
-        let accel_structs = [tlas];
+        let accel_structs = [self.tlas];
         let mut accel_info = vk::WriteDescriptorSetAccelerationStructureKHR::default()
             .acceleration_structures(&accel_structs);
 
