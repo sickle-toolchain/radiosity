@@ -38,18 +38,26 @@ impl Drop for AlternateScreenGuard {
 
 fn format_human_duration(d: Duration) -> String {
     let us = d.as_micros();
-    match us {
-        0..1_000 => format!("{us}µs"),
-        1_000..1_000_000 => format!("{:.2}ms", us as f64 / 1_000.0),
-        _ => {
-            let secs = d.as_secs_f64();
-            match secs {
-                s if s < 60.0 => format!("{s:.2}s"),
-                s if s < 3_600.0 => format!("{:.2}m", s / 60.0),
-                s => format!("{:.2}h", s / 3_600.0),
-            }
-        }
+    if us < 1_000 {
+        return format!("{us}µs");
     }
+    if us < 1_000_000 {
+        return format!("{:.2}ms", us as f64 / 1_000.0);
+    }
+
+    let secs = d.as_secs();
+    if secs < 60 {
+        return format!("{:.2}s", d.as_secs_f64());
+    }
+    if secs < 3_600 {
+        let mins = secs / 60;
+        let rem_secs = secs % 60;
+        return format!("{mins}m {rem_secs}s");
+    }
+
+    let hours = secs / 3_600;
+    let rem_mins = (secs % 3_600) / 60;
+    format!("{hours}h {rem_mins}m")
 }
 
 fn level_prefix(level: &Level) -> &'static str {
