@@ -932,7 +932,7 @@ fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
     Mat3::from_cols(s_axis, t_axis, origin)
 }
 
-#[instrument]
+#[instrument(err)]
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -1168,15 +1168,8 @@ fn main() {
         .with(timing_layer.clone())
         .init();
 
-    let res = {
-        let _a = AlternateScreenGuard::new(move || timing_layer.print_tree(false));
-        run()
-    };
-
-    if let Err(e) = res {
-        e.chain()
-            .rev()
-            .for_each(|e| std::eprintln!("\x1b[31mERROR\x1b[0m\t{e}"));
+    let _screen_guard = AlternateScreenGuard::new(move || timing_layer.print_tree(false));
+    if let Err(_error) = run() {
         std::process::exit(1);
     }
 }

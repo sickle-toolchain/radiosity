@@ -363,7 +363,7 @@ impl Visit for FieldVisitor {
     fn record_str(&mut self, f: &tracing::field::Field, v: &str) {
         match f.name() {
             "log.target" => self.log_target = Some(v.to_string()),
-            "message" => self.message = Some(v.to_string()),
+            "message" | "error" => self.message = Some(v.to_string()),
             _ => self.push_field(f.name(), v),
         }
     }
@@ -371,7 +371,7 @@ impl Visit for FieldVisitor {
     fn record_debug(&mut self, f: &tracing::field::Field, v: &dyn std::fmt::Debug) {
         let formatted = format!("{v:?}").trim_matches('"').to_string();
         match f.name() {
-            "message" => self.message = Some(formatted),
+            "message" | "error" => self.message = Some(formatted),
             "log.target" => self.log_target = Some(formatted),
             _ => {
                 if !self.buf.is_empty() {
