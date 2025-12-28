@@ -877,11 +877,13 @@ dependencies = [
  "bsp",
  "clap",
  "env_logger",
- "log",
  "lump-definitions",
  "shared",
  "spirv-builder",
  "spirv-std",
+ "tracing",
+ "tracing-subscriber",
+ "tracing-timing",
  "zerocopy",
 ]
 
@@ -1466,6 +1468,14 @@ dependencies = [
  "tracing-core",
  "tracing-log",
  "tracing-serde",
+]
+
+[[package]]
+name = "tracing-timing"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

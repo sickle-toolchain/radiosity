@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use log::debug;
+use tracing::debug;
 
 use ash::prelude::VkResult;
 use ash::util::Align;
@@ -140,7 +140,8 @@ impl Buffer {
             .command_pool(self.ctx.pool)
             .level(vk::CommandBufferLevel::PRIMARY);
 
-        let command_buffer = unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }?[0];
+        let command_buffer =
+            unsafe { self.ctx.device.allocate_command_buffers(&allocate_info) }?[0];
 
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);

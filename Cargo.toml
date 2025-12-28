@@ -10,6 +10,7 @@ repository = ""
 [workspace.dependencies]
 spirv-std = { git = "https://github.com/Rust-GPU/rust-gpu" }
 shared = { path = "crates/shared" }
+tracing-timing = { path = "crates/tracing-timing" }
 
 [workspace.lints]
 
@@ -33,13 +34,15 @@ bsp = { git = "https://github.com/sickle-toolchain/bsp" }
 lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
 shared = { workspace = true }
 spirv-std = { workspace = true }
+tracing-timing = { workspace = true }
 
 clap = { version = "4.5.29", features = ["derive"] }
 zerocopy = "0.8.20"
 ash = "0.38.0"
-log = "0.4.28"
 env_logger = "0.11.8"
 anyhow = "1.0.100"
+tracing = "0.1.37"
+tracing-subscriber = { version = "0.3.16", features = ["env-filter", "std"] }
 
 [build-dependencies]
 spirv-builder = { git = "https://github.com/Rust-GPU/rust-gpu" }

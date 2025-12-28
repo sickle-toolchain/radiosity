@@ -1,9 +1,9 @@
 mod buffer;
 
 use anyhow::{Context, Result, bail};
-use log::{Level, log};
 use std::collections::HashSet;
 use std::ffi::{CStr, c_void};
+use tracing::Level;
 
 use ash::ext::debug_utils;
 use ash::vk::{
@@ -19,16 +19,24 @@ extern "system" fn vulkan_debug_utils_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _p_user_data: *mut c_void,
 ) -> vk::Bool32 {
-    let level = match message_severity {
-        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => Level::Debug,
-        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => Level::Warn,
-        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => Level::Error,
-        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => Level::Info,
-        _ => unreachable!(),
-    };
-
     let message = unsafe { CStr::from_ptr((*p_callback_data).p_message) }.to_string_lossy();
-    log!(target: "vulkan", level, "{message}");
+    const TARGET: &str = "vulkan";
+
+    match message_severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
+            tracing::event!(target: TARGET, Level::DEBUG, "{message}");
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+            tracing::event!(target: TARGET, Level::WARN, "{message}");
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+            tracing::event!(target: TARGET, Level::ERROR, "{message}");
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
+            tracing::event!(target: TARGET, Level::INFO, "{message}");
+        }
+        _ => unreachable!(),
+    }
 
     vk::FALSE
 }

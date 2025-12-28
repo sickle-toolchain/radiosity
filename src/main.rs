@@ -8,7 +8,11 @@ use std::rc::Rc;
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use log::{LevelFilter, error, info, warn};
+use tracing::{info, info_span, instrument, warn};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_timing::{AlternateScreenGuard, TreeTimingLayer};
 use zerocopy::IntoBytes;
 
 use ash::ext::scalar_block_layout;
@@ -34,35 +38,6 @@ use radiosity::vulkan::{Buffer, GeometryIndex, VulkanContext};
 use shared::{AlignedVec3, TexelData};
 
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
-
-fn format_duration_ms(ms: f64) -> String {
-    let mut remaining_ms = ms.max(0.0);
-    let hours = (remaining_ms / 3_600_000.0).floor() as u64;
-    remaining_ms -= hours as f64 * 3_600_000.0;
-
-    let minutes = (remaining_ms / 60_000.0).floor() as u64;
-    remaining_ms -= minutes as f64 * 60_000.0;
-
-    let seconds = (remaining_ms / 1_000.0).floor() as u64;
-    remaining_ms -= seconds as f64 * 1_000.0;
-
-    let mut parts = Vec::new();
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if minutes > 0 {
-        parts.push(format!("{minutes}m"));
-    }
-
-    if seconds > 0 {
-        let total_seconds = seconds as f64 + remaining_ms / 1000.0;
-        parts.push(format!("{total_seconds:.3}s"));
-    } else {
-        parts.push(format!("{remaining_ms:.3}ms"));
-    }
-
-    parts.join(" ")
-}
 
 pub struct Application<'a> {
     pub ctx: Rc<VulkanContext>,
@@ -179,7 +154,7 @@ impl Application<'_> {
         }
     }
 
-    fn read_timestamp_ms(&self) -> Result<f64> {
+    fn read_elapsed_ns(&self) -> Result<f64> {
         let mut timestamps = [0u64; 2];
         unsafe {
             self.ctx.device.get_query_pool_results(
@@ -192,10 +167,11 @@ impl Application<'_> {
         let delta_ticks = timestamps[1].saturating_sub(timestamps[0]);
         let time_ns =
             delta_ticks as f64 * self.ctx.physical_device_properties.limits.timestamp_period as f64;
-        Ok(time_ns / 1_000_000.0)
+        Ok(time_ns)
     }
 
     // Create triangular acceleration structure geometry
+    #[instrument(skip_all)]
     fn create_triangle_geometry<I>(
         &'_ self,
         vertices: &[Vertex],
@@ -250,6 +226,7 @@ impl Application<'_> {
     }
 
     // Create instance acceleration structure geometry
+    #[instrument(skip_all)]
     fn create_instance_geometry(
         &'_ self,
         instance: AccelerationStructureKHR,
@@ -306,6 +283,7 @@ impl Application<'_> {
     }
 
     // Create acceleration structure
+    #[instrument(skip(self, geometries, build_range_info, flags))]
     fn create_as(
         &self,
         structure_type: AccelerationStructureTypeKHR,
@@ -377,6 +355,9 @@ impl Application<'_> {
             command_buffers[0]
         };
 
+        let gpu_span = info_span!("GPU", elapsed_ns = ::tracing::field::Empty);
+        let entered = gpu_span.enter();
+
         unsafe {
             self.ctx.device.begin_command_buffer(
                 build_command_buffer,
@@ -412,16 +393,13 @@ impl Application<'_> {
                 .device
                 .free_command_buffers(self.ctx.pool, &[build_command_buffer]);
         }
-
-        let build_time_ms = self.read_timestamp_ms()?;
-        info!(
-            "Built {structure_type:#?} acceleration structure in {}",
-            format_duration_ms(build_time_ms)
-        );
+        gpu_span.record("elapsed_ns", self.read_elapsed_ns()?);
+        drop(entered);
 
         Ok((acceleration_structure, buffer))
     }
 
+    #[instrument(skip_all)]
     pub fn create_acceleration_structures<I>(
         &mut self,
         vertices: &[Vertex],
@@ -458,6 +436,7 @@ impl Application<'_> {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub fn create_pipeline(&mut self) -> Result<usize> {
         let binding_flags_inner = [
             vk::DescriptorBindingFlagsEXT::empty(),
@@ -579,6 +558,7 @@ impl Application<'_> {
         Ok(shader_groups.len())
     }
 
+    #[instrument(skip_all)]
     pub fn create_shader_binding_table(&mut self, shader_group_count: usize) -> Result<u64> {
         let handle_size = self
             .ray_tracing_pipeline_properties
@@ -624,6 +604,7 @@ impl Application<'_> {
         Ok(handle_size_aligned as u64)
     }
 
+    #[instrument(skip_all)]
     pub fn create_descriptor_set(
         &mut self,
         texel_buffer: &Buffer,
@@ -704,6 +685,7 @@ impl Application<'_> {
         Ok(())
     }
 
+    #[instrument(skip_all)]
     pub fn record_ray_tracing(
         &self,
         sbt_handle_size: u64,
@@ -746,6 +728,8 @@ impl Application<'_> {
             .stride(sbt_handle_size);
         let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
 
+        let gpu_span = info_span!("GPU", elapsed_ns = ::tracing::field::Empty);
+        let entered = gpu_span.enter();
         unsafe {
             self.ctx.device.cmd_bind_pipeline(
                 self.command_buffer,
@@ -854,10 +838,8 @@ impl Application<'_> {
             self.ctx.device.queue_wait_idle(self.ctx.queue)?;
         }
 
-        info!(
-            "Ray-tracing shader executed in {}",
-            format_duration_ms(self.read_timestamp_ms()?)
-        );
+        gpu_span.record("elapsed_ns", self.read_elapsed_ns()?);
+        drop(entered);
         Ok(())
     }
 }
@@ -950,6 +932,7 @@ fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
     Mat3::from_cols(s_axis, t_axis, origin)
 }
 
+#[instrument]
 fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -1095,7 +1078,6 @@ fn run() -> Result<()> {
     if let Some(obj_path) = &args.dump_blas_geometry {
         let mut obj_file = File::create(obj_path).context("Failed to create OBJ file")?;
 
-        // Write vertices
         for vertex in vertices.iter() {
             writeln!(
                 obj_file,
@@ -1176,15 +1158,25 @@ fn run() -> Result<()> {
 }
 
 fn main() {
-    env_logger::builder()
-        .filter_level(LevelFilter::Warn)
-        .filter_module("radiosity", LevelFilter::Info)
-        .parse_env("RUST_LOG")
-        .format_timestamp(None)
+    let timing_layer = TreeTimingLayer::default();
+
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("radiosity=info"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(timing_layer.clone())
         .init();
 
-    if let Err(e) = run() {
-        e.chain().rev().for_each(|e| error!("{e}"));
+    let res = {
+        let _a = AlternateScreenGuard::new(move || timing_layer.print_tree(false));
+        run()
+    };
+
+    if let Err(e) = res {
+        e.chain()
+            .rev()
+            .for_each(|e| std::eprintln!("\x1b[31mERROR\x1b[0m\t{e}"));
         std::process::exit(1);
     }
 }
