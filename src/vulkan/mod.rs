@@ -44,6 +44,8 @@ extern "system" fn vulkan_debug_utils_callback(
 pub struct VulkanContext {
     pub entry: Entry,
     pub instance: Instance,
+    pub debug_utils_instance: debug_utils::Instance,
+    pub debug_utils_messenger: vk::DebugUtilsMessengerEXT,
 
     pub physical_device: PhysicalDevice,
     pub physical_device_properties: PhysicalDeviceProperties,
@@ -87,19 +89,6 @@ impl VulkanContext {
                 .api_version(vk::API_VERSION_1_2);
 
             let enabled_extension_names = vec![debug_utils::NAME.as_ptr()];
-            let mut debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
-                .message_severity(
-                    vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                        | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
-                )
-                .message_type(
-                    vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                        | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                        | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-                )
-                .pfn_user_callback(Some(vulkan_debug_utils_callback));
 
             let enabled_layer_names = instance_layers
                 .iter()
@@ -109,11 +98,29 @@ impl VulkanContext {
             let instance_create_info = vk::InstanceCreateInfo::default()
                 .application_info(&application_info)
                 .enabled_layer_names(enabled_layer_names.as_slice())
-                .enabled_extension_names(enabled_extension_names.as_slice())
-                .push_next(&mut debug_utils_create_info);
+                .enabled_extension_names(enabled_extension_names.as_slice());
 
             unsafe { entry.create_instance(&instance_create_info, None) }
                 .context("Failed to create instance")?
+        };
+
+        let debug_utils_create_info = vk::DebugUtilsMessengerCreateInfoEXT::default()
+            .message_severity(
+                vk::DebugUtilsMessageSeverityFlagsEXT::ERROR
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE,
+            )
+            .message_type(
+                vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+            )
+            .pfn_user_callback(Some(vulkan_debug_utils_callback));
+
+        let debug_utils_instance = debug_utils::Instance::new(&entry, &instance);
+        let debug_utils_messenger = unsafe {
+            debug_utils_instance.create_debug_utils_messenger(&debug_utils_create_info, None)?
         };
 
         let physical_device = if let Some(id) = device_id {
@@ -213,6 +220,8 @@ impl VulkanContext {
         Ok(Self {
             entry,
             instance,
+            debug_utils_instance,
+            debug_utils_messenger,
 
             physical_device,
             physical_device_properties,
@@ -232,6 +241,8 @@ impl Drop for VulkanContext {
         unsafe {
             self.device.destroy_command_pool(self.pool, None);
             self.device.destroy_device(None);
+            self.debug_utils_instance
+                .destroy_debug_utils_messenger(self.debug_utils_messenger, None);
             self.instance.destroy_instance(None);
         }
     }
