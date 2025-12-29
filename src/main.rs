@@ -1160,14 +1160,13 @@ fn run() -> Result<()> {
 fn main() {
     let timing_layer = TreeTimingLayer::default();
 
-    let env_filter = EnvFilter::builder()
-        .from_env()
-        .expect("invalid env filter directive(s)")
-        .add_directive("radiosity=info".parse().unwrap());
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("radiosity=info"))
+        .add_directive("error".parse().unwrap());
 
     tracing_subscriber::registry()
-        .with(env_filter)
         .with(timing_layer.clone())
+        .with(env_filter)
         .init();
 
     let _screen_guard = AlternateScreenGuard::new(move || timing_layer.print_tree(false));
