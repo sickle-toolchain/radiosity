@@ -323,7 +323,7 @@ impl TreeTimingLayer {
                     "{}\t{DIM}{prefix}{branch}{RESET}{DIM}@{}{RESET} {}",
                     level_prefix(&ev.level),
                     ev.target,
-                    ev.name
+                    ev.name.replace('\n', " ")
                 ));
             }
         }

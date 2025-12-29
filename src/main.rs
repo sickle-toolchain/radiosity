@@ -1160,8 +1160,10 @@ fn run() -> Result<()> {
 fn main() {
     let timing_layer = TreeTimingLayer::default();
 
-    let env_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("radiosity=info"));
+    let env_filter = EnvFilter::builder()
+        .from_env()
+        .expect("invalid env filter directive(s)")
+        .add_directive("radiosity=info".parse().unwrap());
 
     tracing_subscriber::registry()
         .with(env_filter)
