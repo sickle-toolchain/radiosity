@@ -1,0 +1,15 @@
+[package]
+name = "valve-kv"
+version = "0.1.0"
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+indexmap = "2.13.0"
+pest = "2.7"
+pest_derive = "2.7"

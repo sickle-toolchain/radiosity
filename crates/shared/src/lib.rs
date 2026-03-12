@@ -3,6 +3,7 @@
 #![no_std]
 
 use core::convert::Into;
+pub use lump_definitions::source::EmitType;
 use spirv_std::glam::Vec3;
 
 #[repr(C, align(16))]
@@ -35,4 +36,50 @@ impl TexelData {
             normal: normal.into(),
         }
     }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct Light {
+    pub position: Vec3,
+    pub ty: EmitType,
+    pub color: Vec3,
+    pub radius: f32,
+    pub direction: Vec3,
+    pub constant_attn: f32,
+    pub linear_attn: f32,
+    pub quadratic_attn: f32,
+    pub penumbra_start: f32,
+    pub penumbra_end: f32,
+    pub exponent: f32,
+    pub _pad: [f32; 3],
+}
+
+impl core::fmt::Debug for Light {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Light")
+            .field("position", &self.position)
+            .field("ty", &self.ty)
+            .field("color", &self.color)
+            .field("radius", &self.radius)
+            .field("direction", &self.direction)
+            .field("penumbra_start", &self.penumbra_start)
+            .field("constant_attn", &self.constant_attn)
+            .field("linear_attn", &self.linear_attn)
+            .field("quadratic_attn", &self.quadratic_attn)
+            .field("penumbra_end", &self.penumbra_end)
+            .field("exponent", &self.exponent)
+            .finish()
+    }
+}
+
+unsafe impl bytemuck::Zeroable for Light {}
+unsafe impl bytemuck::Pod for Light {}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct RayPayload {
+    pub hit_pos: Vec3,
+    pub hit_normal: Vec3,
+    pub hit: u32,
 }

@@ -64,11 +64,10 @@ impl VulkanContext {
         device_extensions: &[&CStr],
         device_id: Option<u32>,
     ) -> Result<Self> {
-        let entry = if cfg!(feature = "ash-linked") {
-            Entry::linked()
-        } else {
-            unsafe { Entry::load() }?
-        };
+        #[cfg(feature = "ash-linked")]
+        let entry = Entry::linked();
+        #[cfg(not(feature = "ash-linked"))]
+        let entry = unsafe { Entry::load() }?;
 
         let instance_layer_properties = unsafe { entry.enumerate_instance_layer_properties() }?;
         let supported_layers: Vec<&CStr> = instance_layer_properties
@@ -86,7 +85,7 @@ impl VulkanContext {
         let instance = {
             let application_info = vk::ApplicationInfo::default()
                 .application_from_env()
-                .api_version(vk::API_VERSION_1_2);
+                .api_version(vk::API_VERSION_1_3);
 
             let enabled_extension_names = vec![debug_utils::NAME.as_ptr()];
 
@@ -187,6 +186,10 @@ impl VulkanContext {
         let mut raytracing_pipeline_features =
             vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
 
+        let mut ray_tracing_position_fetch_features =
+            vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
+                .ray_tracing_position_fetch(true);
+
         let enabled_extension_names = device_extensions
             .iter()
             .map(|c| c.as_ptr())
@@ -197,6 +200,7 @@ impl VulkanContext {
             .push_next(&mut features12)
             .push_next(&mut acceleration_structure_features)
             .push_next(&mut raytracing_pipeline_features)
+            .push_next(&mut ray_tracing_position_fetch_features)
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(enabled_extension_names.as_slice());
 
@@ -245,6 +249,20 @@ impl Drop for VulkanContext {
                 .destroy_debug_utils_messenger(self.debug_utils_messenger, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+pub trait GeometryVertex {
+    fn vk_format() -> vk::Format;
+    fn vk_stride() -> vk::DeviceSize;
+}
+
+impl GeometryVertex for [f32; 3] {
+    fn vk_format() -> vk::Format {
+        vk::Format::R32G32B32_SFLOAT
+    }
+    fn vk_stride() -> vk::DeviceSize {
+        size_of::<Self>() as vk::DeviceSize
     }
 }
 
@@ -305,8 +323,7 @@ impl PhysicalDeviceMemoryPropertiesExt for vk::PhysicalDeviceMemoryProperties {
     ) -> Option<u32> {
         for idx in 0..self.memory_type_count {
             let memory_properties = self.memory_types[idx as usize].property_flags;
-
-            if (required_bits & (1 << idx)) == 1
+            if (required_bits & (1 << idx)) != 0
                 && (memory_properties & required_properties) == required_properties
             {
                 return Some(idx);

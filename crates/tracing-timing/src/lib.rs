@@ -12,30 +12,6 @@ use tracing::field::Visit;
 const DIM: &str = "\x1b[90m";
 const RESET: &str = "\x1b[0m";
 
-pub struct AlternateScreenGuard {
-    cb: Option<Box<dyn FnOnce()>>,
-}
-
-impl AlternateScreenGuard {
-    pub fn new(cb: impl FnOnce() + 'static) -> Self {
-        print!("\x1b[?1049h");
-        std::io::stdout().flush().ok();
-        Self {
-            cb: Some(Box::new(cb)),
-        }
-    }
-}
-
-impl Drop for AlternateScreenGuard {
-    fn drop(&mut self) {
-        print!("\x1b[?1049l");
-        std::io::stdout().flush().ok();
-        if let Some(cb) = self.cb.take() {
-            cb();
-        }
-    }
-}
-
 fn format_human_duration(d: Duration) -> String {
     let us = d.as_micros();
     if us < 1_000 {
@@ -85,6 +61,7 @@ enum NodeKey {
 struct TreeState {
     nodes: HashMap<NodeKey, Node>,
     next_event_id: u64,
+    in_alt_screen: bool,
 }
 
 struct EventNode {
@@ -234,8 +211,8 @@ where
 }
 
 impl TreeTimingLayer {
-    pub fn print_tree(&self, clear: bool) {
-        let inner = self.inner.read().unwrap();
+    pub fn print_tree(&self, scroll: bool) {
+        let mut inner = self.inner.write().unwrap();
         let roots: Vec<_> = inner
             .nodes
             .iter()
@@ -248,13 +225,42 @@ impl TreeTimingLayer {
             Self::collect_lines(&inner, root, "", i + 1 == roots.len(), true, &mut lines);
         }
 
-        if clear {
-            print!("\x1b[2J\x1b[H");
+        let term_h = terminal_size::terminal_size()
+            .map(|(_, h)| h.0 as usize)
+            .unwrap_or(24);
+
+        let display_lines = if scroll {
+            let max_lines = term_h.saturating_sub(1);
+            if lines.len() > max_lines {
+                &lines[lines.len() - max_lines..]
+            } else {
+                &lines[..]
+            }
+        } else {
+            &lines[..]
+        };
+
+        let mut buf = String::new();
+
+        if scroll {
+            if !inner.in_alt_screen {
+                buf.push_str("\x1b[?1049h");
+                inner.in_alt_screen = true;
+            }
+            buf.push_str("\x1b[H\x1b[J");
+        } else if inner.in_alt_screen {
+            buf.push_str("\x1b[?1049l");
+            inner.in_alt_screen = false;
         }
-        for line in &lines {
-            println!("{line}");
+
+        for line in display_lines {
+            writeln!(buf, "{line}").ok();
         }
-        std::io::stdout().flush().ok();
+
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        lock.write_all(buf.as_bytes()).ok();
+        lock.flush().ok();
     }
 
     fn collect_lines(

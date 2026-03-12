@@ -1,8 +1,7 @@
 use anyhow::Result;
 use std::ffi::c_void;
 use std::rc::Rc;
-
-use tracing::debug;
+use tracing::{debug, info_span};
 
 use ash::prelude::VkResult;
 use ash::util::Align;
@@ -16,6 +15,7 @@ pub struct Buffer {
     pub(crate) inner: vk::Buffer,
     pub(crate) device_memory: vk::DeviceMemory,
     pub(crate) size: vk::DeviceSize,
+    pub(crate) is_device_local: bool,
 }
 
 impl Buffer {
@@ -61,11 +61,14 @@ impl Buffer {
 
         unsafe { ctx.device.bind_buffer_memory(inner, device_memory, 0) }?;
 
+        let is_device_local = memory_properties.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL);
+
         Ok(Self {
             ctx,
             inner,
             device_memory,
             size,
+            is_device_local,
         })
     }
 
@@ -85,6 +88,17 @@ impl Buffer {
     pub fn store<T: Copy>(&mut self, data: &[T]) {
         unsafe {
             let size = std::mem::size_of_val(data) as u64;
+            let span = info_span!(
+                "buffer store",
+                size = size,
+                dst = if self.is_device_local {
+                    "device"
+                } else {
+                    "host"
+                }
+            );
+            let _enter = span.enter();
+
             let mapped_ptr = self.map(size);
             let mut mapped_slice = Align::new(mapped_ptr, std::mem::align_of::<T>() as u64, size);
             mapped_slice.copy_from_slice(data);
@@ -95,6 +109,17 @@ impl Buffer {
     pub fn load<T: Copy>(&self, element_count: usize) -> Vec<T> {
         unsafe {
             let size = (std::mem::size_of::<T>() * element_count) as u64;
+            let span = info_span!(
+                "buffer load",
+                size = size,
+                src = if self.is_device_local {
+                    "device"
+                } else {
+                    "host"
+                }
+            );
+            let _enter = span.enter();
+
             let mapped_ptr = self
                 .ctx
                 .device
@@ -150,12 +175,7 @@ impl Buffer {
             self.ctx
                 .device
                 .begin_command_buffer(command_buffer, &begin)?;
-            self.ctx.device.cmd_copy_buffer(
-                command_buffer,
-                src.handle(),
-                self.handle(),
-                &[vk::BufferCopy::default().size(size)],
-            );
+            self.cmd_copy_from(command_buffer, src, size);
             self.ctx.device.end_command_buffer(command_buffer)?;
 
             self.ctx.device.queue_submit(
@@ -171,6 +191,22 @@ impl Buffer {
         }
 
         Ok(())
+    }
+
+    pub fn cmd_copy_from(
+        &self,
+        command_buffer: vk::CommandBuffer,
+        src: &Buffer,
+        size: vk::DeviceSize,
+    ) {
+        unsafe {
+            self.ctx.device.cmd_copy_buffer(
+                command_buffer,
+                src.handle(),
+                self.handle(),
+                &[vk::BufferCopy::default().size(size)],
+            );
+        }
     }
 }
 
