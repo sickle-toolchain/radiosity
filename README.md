@@ -7,6 +7,8 @@ BSP Lightmap Compiler
 </div>
 
 ##
+>[!WARNING]
+This project is far from complete and or usable, and more than anything serves as a personal test bed for lighting currently.
 
 ### Requirements
 In order to use radiosity you must have a physical device supporting the `VK_KHR_RAY_TRACING_PIPELINE` extension.  
