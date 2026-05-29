@@ -4,7 +4,7 @@ use spirv_std::ray_tracing::{AccelerationStructure, RayFlags};
 #[allow(unused_imports)]
 use spirv_std::num_traits::Float;
 
-use shared::{EmitType, Light};
+use shared::{EmitType, Light, Sky};
 
 use crate::{HitKind, RayPayload};
 
@@ -12,22 +12,24 @@ pub const SHADOW_EPSILON: f32 = 0.25;
 pub const INTENSITY_SCALE: f32 = 255.0;
 
 #[inline(always)]
-pub fn contribute_sky_ambient(light: &Light) -> Vec3 {
-    light.color.0
-}
-
-#[inline(always)]
-pub fn contribute_sky_light(
-    light: &Light,
+pub fn contribute_sky(
+    sky: &Sky,
     sample_pos: Vec3,
     sample_normal: Vec3,
     tlas: &AccelerationStructure,
     payload: &mut RayPayload,
 ) -> Vec3 {
-    let sun_dir = -light.direction.0;
+    let mut result = sky.ambient_color.0;
+
+    let sun_color = sky.sun_color.0;
+    if sun_color.length_squared() <= 0.0 {
+        return result;
+    }
+
+    let sun_dir = -sky.sun_direction.0;
     let n_dot_l = sample_normal.dot(sun_dir);
     if n_dot_l <= 0.0 {
-        return Vec3::ZERO;
+        return result;
     }
 
     let ray_origin = sample_pos + sample_normal * SHADOW_EPSILON;
@@ -49,10 +51,10 @@ pub fn contribute_sky_light(
     }
 
     if matches!(payload, HitKind::Sky) {
-        light.color.0 * INTENSITY_SCALE
-    } else {
-        Vec3::ZERO
+        result += sun_color * INTENSITY_SCALE;
     }
+
+    result
 }
 
 #[inline(always)]

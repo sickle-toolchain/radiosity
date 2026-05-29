@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Parser;
 use tracing::{error, info, info_span, instrument, warn};
 use tracing_subscriber::EnvFilter;
@@ -101,11 +101,12 @@ pub struct Application<'a> {
 }
 
 impl Application<'_> {
-    pub const SBT_GROUP_RAYGEN_DIRECT: u32 = 0;
-    pub const SBT_GROUP_RAYGEN_GI: u32 = 1;
-    pub const SBT_GROUP_MISS: u32 = 2;
-    pub const SBT_GROUP_HIT: u32 = 3;
-    pub const SBT_GROUP_SKY_HIT: u32 = 4;
+    pub const SBT_GROUP_RAYGEN_SKY: u32 = 0;
+    pub const SBT_GROUP_RAYGEN_WORLD: u32 = 1;
+    pub const SBT_GROUP_RAYGEN_GI: u32 = 2;
+    pub const SBT_GROUP_MISS: u32 = 3;
+    pub const SBT_GROUP_HIT: u32 = 4;
+    pub const SBT_GROUP_SKY_HIT: u32 = 5;
 
     pub fn new(ctx: Rc<VulkanContext>) -> Result<Self> {
         let acceleration_structure_device =
@@ -530,29 +531,33 @@ impl Application<'_> {
     pub fn create_pipeline(&mut self) -> Result<usize> {
         self.descriptor_set_layout = unsafe {
             self.ctx.device.create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .bindings(&[
-                        vk::DescriptorSetLayoutBinding::default()
-                            .descriptor_count(1)
-                            .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
-                            .binding(0),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(1)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(2)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(3)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    ]),
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
+                    vk::DescriptorSetLayoutBinding::default()
+                        .descriptor_count(1)
+                        .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
+                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
+                        .binding(0),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(1)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(2)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(3)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                    vk::DescriptorSetLayoutBinding::default()
+                        .binding(4)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                ]),
                 None,
             )
         }?;
@@ -581,44 +586,41 @@ impl Application<'_> {
                 .create_shader_module(&shader_module_create_info, None)
         }?;
 
+        let general_group = |shader: u32| {
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+                .general_shader(shader)
+                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR)
+        };
+        let hit_group = |closest_hit: u32| {
+            vk::RayTracingShaderGroupCreateInfoKHR::default()
+                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                .general_shader(vk::SHADER_UNUSED_KHR)
+                .closest_hit_shader(closest_hit)
+                .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                .intersection_shader(vk::SHADER_UNUSED_KHR)
+        };
+
         let shader_groups = vec![
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(Self::SBT_GROUP_RAYGEN_DIRECT)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(Self::SBT_GROUP_RAYGEN_GI)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(Self::SBT_GROUP_MISS)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(Self::SBT_GROUP_HIT)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(Self::SBT_GROUP_SKY_HIT)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
+            general_group(Self::SBT_GROUP_RAYGEN_SKY),
+            general_group(Self::SBT_GROUP_RAYGEN_WORLD),
+            general_group(Self::SBT_GROUP_RAYGEN_GI),
+            general_group(Self::SBT_GROUP_MISS),
+            hit_group(Self::SBT_GROUP_HIT),
+            hit_group(Self::SBT_GROUP_SKY_HIT),
         ];
 
         let shader_stages = vec![
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::RAYGEN_KHR)
                 .module(shader_module)
-                .name(c"ray_generation_direct"),
+                .name(c"ray_generation_sky"),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
+                .module(shader_module)
+                .name(c"ray_generation_world"),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::RAYGEN_KHR)
                 .module(shader_module)
@@ -710,8 +712,9 @@ impl Application<'_> {
     pub fn create_descriptor_set(
         &mut self,
         texel_buffer: &Buffer,
-        lighting_buffer: &Buffer,
-        lights_buffer: &Buffer,
+        output_buffer: &Buffer,
+        sky_buffer: &Buffer,
+        world_lights_buffer: &Buffer,
     ) -> Result<()> {
         let descriptor_sizes = [
             vk::DescriptorPoolSize {
@@ -720,7 +723,7 @@ impl Application<'_> {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 3,
+                descriptor_count: 4,
             },
         ];
 
@@ -766,33 +769,45 @@ impl Application<'_> {
             .buffer_info(&texel_info)
             .descriptor_count(1);
 
-        let lighting_info = [vk::DescriptorBufferInfo::default()
-            .buffer(lighting_buffer.handle())
+        let output_info = [vk::DescriptorBufferInfo::default()
+            .buffer(output_buffer.handle())
             .range(vk::WHOLE_SIZE)];
 
-        let lighting_write = vk::WriteDescriptorSet::default()
+        let output_write = vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(2)
             .dst_array_element(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&lighting_info)
+            .buffer_info(&output_info)
             .descriptor_count(1);
 
-        let lights_info = [vk::DescriptorBufferInfo::default()
-            .buffer(lights_buffer.handle())
+        let world_info = [vk::DescriptorBufferInfo::default()
+            .buffer(world_lights_buffer.handle())
             .range(vk::WHOLE_SIZE)];
 
-        let lights_write = vk::WriteDescriptorSet::default()
+        let world_write = vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
             .dst_binding(3)
             .dst_array_element(0)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(&lights_info)
+            .buffer_info(&world_info)
+            .descriptor_count(1);
+
+        let sky_info = [vk::DescriptorBufferInfo::default()
+            .buffer(sky_buffer.handle())
+            .range(vk::WHOLE_SIZE)];
+
+        let sky_write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(4)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&sky_info)
             .descriptor_count(1);
 
         unsafe {
             self.ctx.device.update_descriptor_sets(
-                &[accel_write, texel_write, lighting_write, lights_write],
+                &[accel_write, texel_write, output_write, world_write, sky_write],
                 &[],
             );
         }
@@ -808,8 +823,8 @@ impl Application<'_> {
         &self,
         sbt_handle_size: u64,
         texel_count: usize,
-        lighting_device: &Buffer,
-        lighting_readback: Option<&Buffer>,
+        output_device: &Buffer,
+        output_readback: Option<&Buffer>,
     ) -> Result<()> {
         let sbt_buffer = self
             .shader_binding_table_buffer
@@ -829,8 +844,13 @@ impl Application<'_> {
 
         let sbt_address = sbt_buffer.device_address();
 
-        let sbt_raygen_region_direct = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_DIRECT as u64 * sbt_handle_size)
+        let sbt_raygen_region_sky = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_SKY as u64 * sbt_handle_size)
+            .size(sbt_handle_size)
+            .stride(sbt_handle_size);
+
+        let sbt_raygen_region_world = vk::StridedDeviceAddressRegionKHR::default()
+            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_WORLD as u64 * sbt_handle_size)
             .size(sbt_handle_size)
             .stride(sbt_handle_size);
 
@@ -873,21 +893,51 @@ impl Application<'_> {
                 &[],
             );
 
-            let direct_span = info_span!("PASS: Direct Illumination");
-            let _entered_direct = direct_span.enter();
+            {
+                let _span = info_span!("PASS: Sky Illumination").entered();
+                self.ray_tracing_pipeline_device.cmd_trace_rays(
+                    self.command_buffer,
+                    &sbt_raygen_region_sky,
+                    &sbt_miss_region,
+                    &sbt_hit_region,
+                    &sbt_call_region,
+                    texel_count as u32,
+                    1,
+                    1,
+                );
+            }
 
-            self.ray_tracing_pipeline_device.cmd_trace_rays(
+            let barrier = vk::BufferMemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_device.handle())
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            self.ctx.device.cmd_pipeline_barrier(
                 self.command_buffer,
-                &sbt_raygen_region_direct,
-                &sbt_miss_region,
-                &sbt_hit_region,
-                &sbt_call_region,
-                texel_count as u32,
-                1,
-                1,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[barrier],
+                &[],
             );
 
-            drop(_entered_direct);
+            {
+                let _span = info_span!("PASS: World Illumination").entered();
+                self.ray_tracing_pipeline_device.cmd_trace_rays(
+                    self.command_buffer,
+                    &sbt_raygen_region_world,
+                    &sbt_miss_region,
+                    &sbt_hit_region,
+                    &sbt_call_region,
+                    texel_count as u32,
+                    1,
+                    1,
+                );
+            }
 
             let gi_span = info_span!("PASS: Global Illumination");
             let _entered_gi = gi_span.enter();
@@ -900,7 +950,7 @@ impl Application<'_> {
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(lighting_device.handle())
+                    .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
 
@@ -933,13 +983,13 @@ impl Application<'_> {
 
             drop(_entered_gi);
 
-            if let Some(readback) = lighting_readback {
+            if let Some(readback) = output_readback {
                 let to_transfer = vk::BufferMemoryBarrier::default()
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(lighting_device.handle())
+                    .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
                 self.ctx.device.cmd_pipeline_barrier(
@@ -954,7 +1004,7 @@ impl Application<'_> {
 
                 self.ctx.device.cmd_copy_buffer(
                     self.command_buffer,
-                    lighting_device.handle(),
+                    output_device.handle(),
                     readback.handle(),
                     &[vk::BufferCopy::default().size(readback.size())],
                 );
@@ -982,7 +1032,7 @@ impl Application<'_> {
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(lighting_device.handle())
+                    .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
                 self.ctx.device.cmd_pipeline_barrier(
@@ -1197,6 +1247,11 @@ fn run(args: Args) -> Result<()> {
             }
         }
     }
+
+    if texels.is_empty() {
+        bail!("no texels");
+    }
+
     let mut texel_staging = Buffer::new(
         ctx.clone(),
         (size_of::<TexelData>() * texels.len()) as u64,
@@ -1231,7 +1286,7 @@ fn run(args: Args) -> Result<()> {
     )?;
     texel_buffer.cmd_copy_from(init_command_buffer, &texel_staging, texel_staging.size());
 
-    let lighting_buffer_device = Buffer::new(
+    let output_buffer = Buffer::new(
         ctx.clone(),
         (size_of::<AlignedVec3>() * texels.len()) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1240,9 +1295,9 @@ fn run(args: Args) -> Result<()> {
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    let lighting_buffer_readback = Buffer::new(
+    let output_readback = Buffer::new(
         ctx.clone(),
-        lighting_buffer_device.size(),
+        output_buffer.size(),
         vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
@@ -1341,7 +1396,8 @@ fn run(args: Args) -> Result<()> {
         }
     }
 
-    let mut lights: Vec<shared::Light> = Vec::new();
+    let mut world_lights: Vec<shared::Light> = Vec::new();
+    let mut sky = shared::Sky::default();
 
     let worldlights = bsp
         .get_lump::<[WorldLight]>(LumpDefinition::WorldLights)
@@ -1357,79 +1413,103 @@ fn run(args: Args) -> Result<()> {
             continue;
         };
 
-        let mut c = wl.constant_attn;
-        let mut l = wl.linear_attn;
-        let mut q = wl.quadratic_attn;
-
-        let color = [wl.intensity[0], wl.intensity[1], wl.intensity[2], wl.radius];
+        let color = Vec3::new(wl.intensity[0], wl.intensity[1], wl.intensity[2]);
 
         match ty {
-            EmitType::Point | EmitType::Spotlight => {
-                if c < 0.0001 && l < 0.0001 && q < 0.0001 {
-                    c = 1.0;
+            EmitType::SkyLight => {
+                sky.sun_direction = Vec3::new(wl.normal[0], wl.normal[1], wl.normal[2]).into();
+                sky.sun_color = color.into();
+            }
+            EmitType::SkyAmbient => {
+                sky.ambient_color = (sky.ambient_color.0 + color).into();
+            }
+            EmitType::Point | EmitType::Spotlight | EmitType::Surface | EmitType::QuakeLight => {
+                let mut c = wl.constant_attn;
+                let mut l = wl.linear_attn;
+                let mut q = wl.quadratic_attn;
+
+                match ty {
+                    EmitType::Point | EmitType::Spotlight => {
+                        if c < 0.0001 && l < 0.0001 && q < 0.0001 {
+                            c = 1.0;
+                        }
+                    }
+                    EmitType::Surface => {
+                        if c < 0.0001 && l < 0.0001 && q < 0.0001 {
+                            q = 1.0;
+                        }
+                    }
+                    EmitType::QuakeLight => {
+                        c = 0.0;
+                        l = 1.0;
+                        q = 0.0;
+                    }
+                    _ => {}
                 }
-            }
-            EmitType::Surface => {
-                if c < 0.0001 && l < 0.0001 && q < 0.0001 {
-                    q = 1.0;
-                }
-            }
-            EmitType::SkyLight | EmitType::SkyAmbient => {
-                c = 1.0;
-                l = 0.0;
-                q = 0.0;
-            }
-            EmitType::QuakeLight => {
-                c = 0.0;
-                l = 1.0;
-                q = 0.0;
+
+                let light = shared::Light {
+                    position: Vec3::new(wl.origin[0], wl.origin[1], wl.origin[2]).into(),
+                    color: color.into(),
+                    direction: Vec3::new(wl.normal[0], wl.normal[1], wl.normal[2]).into(),
+                    ty,
+                    radius: wl.radius,
+                    constant_attn: c,
+                    linear_attn: l,
+                    quadratic_attn: q,
+                    penumbra_start: wl.penumbra_start,
+                    penumbra_end: wl.penumbra_end,
+                    exponent: wl.exponent,
+                };
+
+                tracing::info!("World light {i}: {light:?}");
+                world_lights.push(light);
             }
         }
-
-        let light = shared::Light {
-            position: Vec3::new(wl.origin[0], wl.origin[1], wl.origin[2]).into(),
-            color: Vec3::new(color[0], color[1], color[2]).into(),
-            direction: Vec3::new(wl.normal[0], wl.normal[1], wl.normal[2]).into(),
-            ty,
-            radius: color[3],
-            constant_attn: c,
-            linear_attn: l,
-            quadratic_attn: q,
-            penumbra_start: wl.penumbra_start,
-            penumbra_end: wl.penumbra_end,
-            exponent: wl.exponent,
-        };
-
-        tracing::info!("Light {i}: {light:?}");
-
-        lights.push(light);
     }
 
     if let Some(ambient_color) = ambient_override {
-        for light in lights.iter_mut() {
-            if light.ty == EmitType::SkyAmbient {
-                light.color = ambient_color.into();
-            }
-        }
+        sky.ambient_color = ambient_color.into();
     }
 
-    let mut lights_staging = Buffer::new(
+    tracing::info!("Sky: {sky:?}");
+
+    let mut sky_staging = Buffer::new(
         ctx.clone(),
-        (size_of::<shared::Light>() * lights.len()) as u64,
+        size_of::<shared::Sky>() as u64,
         vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
-    lights_staging.store(&lights);
+    sky_staging.store(std::slice::from_ref(&sky));
 
-    let lights_buffer_device = Buffer::new(
+    let sky_buffer = Buffer::new(
         ctx.clone(),
-        lights_staging.size(),
+        sky_staging.size(),
         vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
-    lights_buffer_device.cmd_copy_from(init_command_buffer, &lights_staging, lights_staging.size());
+    sky_buffer.cmd_copy_from(init_command_buffer, &sky_staging, sky_staging.size());
+
+    let world_bytes = (size_of::<shared::Light>() * world_lights.len()).max(1) as vk::DeviceSize;
+    let mut world_staging = Buffer::new(
+        ctx.clone(),
+        world_bytes,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let world_buffer = Buffer::new(
+        ctx.clone(),
+        world_bytes,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+            | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+    if !world_lights.is_empty() {
+        world_staging.store(&world_lights);
+        world_buffer.cmd_copy_from(init_command_buffer, &world_staging, world_bytes);
+    }
 
     let init_to_rt_barrier = vk::MemoryBarrier::default()
         .src_access_mask(
@@ -1466,17 +1546,18 @@ fn run(args: Args) -> Result<()> {
 
     app.create_descriptor_set(
         &texel_buffer,
-        &lighting_buffer_device,
-        &lights_buffer_device,
+        &output_buffer,
+        &sky_buffer,
+        &world_buffer,
     )?;
     app.record_ray_tracing(
         sbt_handle_size,
         texels.len(),
-        &lighting_buffer_device,
-        Some(&lighting_buffer_readback),
+        &output_buffer,
+        Some(&output_readback),
     )?;
 
-    let lighting: Vec<AlignedVec3> = lighting_buffer_readback.load(texels.len());
+    let lighting: Vec<AlignedVec3> = output_readback.load(texels.len());
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
     let mut lighting_hdr_lump = bsp.lump_mut(LumpDefinition::LightingHdr);
 

@@ -13,7 +13,7 @@ use spirv_std::spirv;
 #[allow(unused_imports)]
 use spirv_std::num_traits::Float;
 
-use shared::{AlignedVec3, EmitType, Light, TexelData};
+use shared::{AlignedVec3, Light, Sky, TexelData};
 
 #[repr(u32)]
 pub enum HitKind {
@@ -44,11 +44,32 @@ pub fn sky_hit(#[spirv(incoming_ray_payload)] payload: &mut RayPayload) {
 }
 
 #[spirv(ray_generation)]
-pub fn ray_generation_direct(
+pub fn ray_generation_sky(
     #[spirv(launch_id)] launch_id: UVec3,
     #[spirv(descriptor_set = 0, binding = 0)] tlas: &AccelerationStructure,
     #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] texels: &[TexelData],
-    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] lighting: &mut [AlignedVec3],
+    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] output: &mut [AlignedVec3],
+    #[spirv(descriptor_set = 0, binding = 4, storage_buffer)] sky: &Sky,
+    #[spirv(ray_payload)] payload: &mut RayPayload,
+) {
+    let idx = launch_id.x as usize;
+
+    if idx >= texels.len() {
+        return;
+    }
+
+    let texel = texels[idx];
+    let result = light::contribute_sky(sky, texel.position.0, texel.normal.0, tlas, payload);
+
+    output[idx] = AlignedVec3(result);
+}
+
+#[spirv(ray_generation)]
+pub fn ray_generation_world(
+    #[spirv(launch_id)] launch_id: UVec3,
+    #[spirv(descriptor_set = 0, binding = 0)] tlas: &AccelerationStructure,
+    #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] texels: &[TexelData],
+    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] output: &mut [AlignedVec3],
     #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] lights: &[Light],
     #[spirv(ray_payload)] payload: &mut RayPayload,
 ) {
@@ -62,23 +83,14 @@ pub fn ray_generation_direct(
     let sample_pos: Vec3 = texel.position.0;
     let sample_normal: Vec3 = texel.normal.0;
 
-    let mut result = Vec3::ZERO;
+    let mut result = output[idx].0;
 
     for i in 0..lights.len() {
-        let light = &lights[i];
-
-        result += match light.ty {
-            EmitType::SkyAmbient => light::contribute_sky_ambient(light),
-            EmitType::SkyLight => {
-                light::contribute_sky_light(light, sample_pos, sample_normal, tlas, payload)
-            }
-            EmitType::Point | EmitType::Spotlight | EmitType::Surface | EmitType::QuakeLight => {
-                light::contribute_positional(light, sample_pos, sample_normal, tlas, payload)
-            }
-        };
+        result +=
+            light::contribute_positional(&lights[i], sample_pos, sample_normal, tlas, payload);
     }
 
-    lighting[idx] = AlignedVec3(result);
+    output[idx] = AlignedVec3(result);
 }
 
 #[spirv(ray_generation)]
@@ -86,8 +98,7 @@ pub fn ray_generation_gi(
     #[spirv(launch_id)] _launch_id: UVec3,
     #[spirv(descriptor_set = 0, binding = 0)] _tlas: &AccelerationStructure,
     #[spirv(descriptor_set = 0, binding = 1, storage_buffer)] _texels: &[TexelData],
-    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] _lighting: &mut [AlignedVec3],
-    #[spirv(descriptor_set = 0, binding = 3, storage_buffer)] _lights: &[Light],
+    #[spirv(descriptor_set = 0, binding = 2, storage_buffer)] _output: &mut [AlignedVec3],
     #[spirv(ray_payload)] _payload: &mut RayPayload,
 ) {
     black_box(())

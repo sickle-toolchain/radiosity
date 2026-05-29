@@ -76,6 +76,14 @@ unsafe impl bytemuck::Zeroable for Light {}
 unsafe impl bytemuck::Pod for Light {}
 
 #[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Sky {
+    pub sun_direction: AlignedVec3,
+    pub sun_color: AlignedVec3,
+    pub ambient_color: AlignedVec3,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct RayPayload {
     pub hit_pos: Vec3,
