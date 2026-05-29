@@ -528,16 +528,6 @@ impl Application<'_> {
 
     #[instrument(skip_all)]
     pub fn create_pipeline(&mut self) -> Result<usize> {
-        let binding_flags_inner = [
-            vk::DescriptorBindingFlagsEXT::empty(),
-            vk::DescriptorBindingFlagsEXT::empty(),
-            vk::DescriptorBindingFlagsEXT::empty(),
-            vk::DescriptorBindingFlagsEXT::empty(),
-        ];
-
-        let mut binding_flags = vk::DescriptorSetLayoutBindingFlagsCreateInfoEXT::default()
-            .binding_flags(&binding_flags_inner);
-
         self.descriptor_set_layout = unsafe {
             self.ctx.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()
@@ -562,8 +552,7 @@ impl Application<'_> {
                             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                             .descriptor_count(1)
                             .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    ])
-                    .push_next(&mut binding_flags),
+                    ]),
                 None,
             )
         }?;
@@ -745,15 +734,11 @@ impl Application<'_> {
                 .create_descriptor_pool(&descriptor_pool_info, None)
         }?;
 
-        let mut count_allocate_info =
-            vk::DescriptorSetVariableDescriptorCountAllocateInfo::default().descriptor_counts(&[1]);
-
         let descriptor_set = unsafe {
             self.ctx.device.allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[self.descriptor_set_layout])
-                    .push_next(&mut count_allocate_info),
+                    .set_layouts(&[self.descriptor_set_layout]),
             )
         }?[0];
 
