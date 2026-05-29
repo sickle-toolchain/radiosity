@@ -28,7 +28,7 @@ use spirv_std::glam::{Mat3, Vec3};
 
 use bsp::Bsp;
 use lump_definitions::source::{
-    ColorRGBExp32, EmitType, Face, LumpDefinition, Plane, SurfaceEdge, SurfaceFlags, TextureInfo,
+    ColorRGBExp32, EmitType, Face, LumpDefinition, Plane, SurfaceEdge, SurfaceFlags, TextureData,
     Vertex, WorldLight,
 };
 
@@ -1311,7 +1311,6 @@ fn run(args: Args) -> Result<()> {
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
 
-    // TODO: check for tools/toolsblocklight
     const INVISIBLE_FLAGS: u16 =
         SurfaceFlags::NODRAW | SurfaceFlags::TRIGGER | SurfaceFlags::HINT | SurfaceFlags::SKIP;
 
