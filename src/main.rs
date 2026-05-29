@@ -78,6 +78,8 @@ pub struct Application<'a> {
     pub ray_tracing_pipeline_device: ray_tracing_pipeline::Device,
     pub ray_tracing_pipeline_properties: PhysicalDeviceRayTracingPipelinePropertiesKHR<'a>,
 
+    pub scratch_offset_alignment: u32,
+
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_set: vk::DescriptorSet,
@@ -116,9 +118,12 @@ impl Application<'_> {
 
         let mut ray_tracing_pipeline_properties =
             PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+        let mut acceleration_structure_properties =
+            vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
         {
             let mut physical_device_properties2 = vk::PhysicalDeviceProperties2::default()
-                .push_next(&mut ray_tracing_pipeline_properties);
+                .push_next(&mut ray_tracing_pipeline_properties)
+                .push_next(&mut acceleration_structure_properties);
 
             unsafe {
                 ctx.instance.get_physical_device_properties2(
@@ -127,6 +132,8 @@ impl Application<'_> {
                 );
             }
         }
+        let scratch_offset_alignment = acceleration_structure_properties
+            .min_acceleration_structure_scratch_offset_alignment;
 
         let timestamp_query_pool_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
@@ -150,6 +157,7 @@ impl Application<'_> {
             acceleration_structure_device,
             ray_tracing_pipeline_device,
             ray_tracing_pipeline_properties,
+            scratch_offset_alignment,
             timestamp_query_pool,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
             descriptor_pool: vk::DescriptorPool::null(),
@@ -379,15 +387,19 @@ impl Application<'_> {
         }?;
         build_info.dst_acceleration_structure = acceleration_structure;
 
+        let scratch_alignment = self.scratch_offset_alignment.max(1) as vk::DeviceSize;
         let scratch_buffer = Buffer::new(
             self.ctx.clone(),
-            sizes_info.build_scratch_size,
+            sizes_info.build_scratch_size + scratch_alignment - 1,
             vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS | vk::BufferUsageFlags::STORAGE_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
 
+        let scratch_address =
+            (scratch_buffer.device_address() + scratch_alignment - 1) & !(scratch_alignment - 1);
+
         build_info.scratch_data = vk::DeviceOrHostAddressKHR {
-            device_address: scratch_buffer.device_address(),
+            device_address: scratch_address,
         };
 
         unsafe {
