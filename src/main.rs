@@ -251,20 +251,35 @@ impl Application<'_> {
 
     #[instrument(skip_all)]
     fn create_input_buffer<T: Copy>(
-        &'_ self,
+        &self,
+        command_buffer: vk::CommandBuffer,
+        staging: &mut Vec<Buffer>,
         data: &[T],
         usage: vk::BufferUsageFlags,
     ) -> Result<Buffer> {
-        let mut buffer = Buffer::new(
+        let bytes = size_of_val(data) as vk::DeviceSize;
+
+        let mut src = Buffer::new(
             self.ctx.clone(),
-            size_of_val(data) as vk::DeviceSize,
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
-                | usage,
+            bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
-        buffer.store(data);
-        Ok(buffer)
+        src.store(data);
+
+        let dst = Buffer::new(
+            self.ctx.clone(),
+            bytes,
+            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | usage,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        dst.cmd_copy_from(command_buffer, &src, bytes);
+
+        staging.push(src);
+        Ok(dst)
     }
 
     // Create instance acceleration structure geometry
@@ -391,10 +406,44 @@ impl Application<'_> {
         I: GeometryIndex + Copy,
     {
         let mut temp_buffers = Vec::new();
-        let vertex_buffer =
-            self.create_input_buffer(vertices, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-        let solid_index_buffer =
-            self.create_input_buffer(solid_indices, vk::BufferUsageFlags::INDEX_BUFFER)?;
+
+        let vertex_buffer = self.create_input_buffer(
+            command_buffer,
+            &mut temp_buffers,
+            vertices,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        let solid_index_buffer = self.create_input_buffer(
+            command_buffer,
+            &mut temp_buffers,
+            solid_indices,
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        )?;
+        let sky_index_buffer = if sky_indices.is_empty() {
+            None
+        } else {
+            Some(self.create_input_buffer(
+                command_buffer,
+                &mut temp_buffers,
+                sky_indices,
+                vk::BufferUsageFlags::INDEX_BUFFER,
+            )?)
+        };
+
+        let upload_barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+        unsafe {
+            self.ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::DependencyFlags::empty(),
+                &[upload_barrier],
+                &[],
+                &[],
+            );
+        }
 
         let solid_geometry = self.create_triangle_geometry::<V, I>(
             &vertex_buffer,
@@ -414,9 +463,7 @@ impl Application<'_> {
         temp_buffers.push(solid_scratch);
 
         // Build sky BLAS if there are sky faces
-        let sky_blas_opt = if !sky_indices.is_empty() {
-            let sky_index_buffer =
-                self.create_input_buffer(sky_indices, vk::BufferUsageFlags::INDEX_BUFFER)?;
+        let sky_blas_opt = if let Some(sky_index_buffer) = sky_index_buffer {
             let sky_geometry = self.create_triangle_geometry::<V, I>(
                 &vertex_buffer,
                 &sky_index_buffer,
@@ -1356,7 +1403,7 @@ fn run(args: Args) -> Result<()> {
     );
 
     let vertices: &[[f32; 3]] = zerocopy::transmute_ref!(&*vertices);
-    let _setup_buffers = app.create_acceleration_structures(
+    let setup_buffers = app.create_acceleration_structures(
         init_command_buffer,
         vertices,
         &solid_indices,
@@ -1540,6 +1587,8 @@ fn run(args: Args) -> Result<()> {
         ctx.device
             .free_command_buffers(ctx.pool, &[init_command_buffer]);
     }
+
+    drop(setup_buffers);
 
     let shader_group_count = app.create_pipeline()?;
     let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
