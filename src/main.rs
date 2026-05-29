@@ -28,7 +28,7 @@ use spirv_std::glam::{Mat3, Vec3};
 
 use bsp::Bsp;
 use lump_definitions::source::{
-    ColorRGBExp32, EmitType, Face, LumpDefinition, Plane, SurfaceEdge, SurfaceFlags, TextureData,
+    ColorRGBExp32, EmitType, Face, LumpDefinition, Plane, SurfaceEdge, SurfaceFlags, TextureInfo,
     Vertex, WorldLight,
 };
 
@@ -878,17 +878,6 @@ impl Application<'_> {
             .as_ref()
             .context("SBT buffer not created")?;
 
-        let begin_info = vk::CommandBufferBeginInfo::default()
-            .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            self.ctx
-                .device
-                .reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())?;
-            self.ctx
-                .device
-                .begin_command_buffer(self.command_buffer, &begin_info)?;
-        }
-
         let sbt_address = sbt_buffer.device_address();
 
         let sbt_raygen_region_sky = vk::StridedDeviceAddressRegionKHR::default()
@@ -1269,20 +1258,14 @@ fn run(args: Args) -> Result<()> {
     )?;
     texel_staging.store(&texels);
 
-    let init_command_buffer = {
-        let allocate_info = vk::CommandBufferAllocateInfo::default()
-            .command_buffer_count(1)
-            .command_pool(ctx.pool)
-            .level(vk::CommandBufferLevel::PRIMARY);
-        unsafe { ctx.device.allocate_command_buffers(&allocate_info) }?[0]
-    };
+    let command_buffer = app.command_buffer;
 
     let begin_info =
         vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 
     unsafe {
         ctx.device
-            .begin_command_buffer(init_command_buffer, &begin_info)?;
+            .begin_command_buffer(command_buffer, &begin_info)?;
     }
 
     let texel_buffer = Buffer::new(
@@ -1293,7 +1276,7 @@ fn run(args: Args) -> Result<()> {
             | vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
-    texel_buffer.cmd_copy_from(init_command_buffer, &texel_staging, texel_staging.size());
+    texel_buffer.cmd_copy_from(command_buffer, &texel_staging, texel_staging.size());
 
     let output_buffer = Buffer::new(
         ctx.clone(),
@@ -1365,7 +1348,7 @@ fn run(args: Args) -> Result<()> {
 
     let vertices: &[[f32; 3]] = zerocopy::transmute_ref!(&*vertices);
     let setup_buffers = app.create_acceleration_structures(
-        init_command_buffer,
+        command_buffer,
         vertices,
         &solid_indices,
         &sky_indices,
@@ -1497,7 +1480,7 @@ fn run(args: Args) -> Result<()> {
             | vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
-    sky_buffer.cmd_copy_from(init_command_buffer, &sky_staging, sky_staging.size());
+    sky_buffer.cmd_copy_from(command_buffer, &sky_staging, sky_staging.size());
 
     let world_bytes = (size_of::<shared::Light>() * world_lights.len()).max(1) as vk::DeviceSize;
     let mut world_staging = Buffer::new(
@@ -1516,7 +1499,7 @@ fn run(args: Args) -> Result<()> {
     )?;
     if !world_lights.is_empty() {
         world_staging.store(&world_lights);
-        world_buffer.cmd_copy_from(init_command_buffer, &world_staging, world_bytes);
+        world_buffer.cmd_copy_from(command_buffer, &world_staging, world_bytes);
     }
 
     let init_to_rt_barrier = vk::MemoryBarrier::default()
@@ -1529,7 +1512,7 @@ fn run(args: Args) -> Result<()> {
 
     unsafe {
         ctx.device.cmd_pipeline_barrier(
-            init_command_buffer,
+            command_buffer,
             vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
                 | vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
@@ -1538,18 +1521,7 @@ fn run(args: Args) -> Result<()> {
             &[],
             &[],
         );
-        ctx.device.end_command_buffer(init_command_buffer)?;
-        ctx.device.queue_submit(
-            ctx.queue,
-            &[vk::SubmitInfo::default().command_buffers(&[init_command_buffer])],
-            vk::Fence::null(),
-        )?;
-        ctx.device.queue_wait_idle(ctx.queue)?;
-        ctx.device
-            .free_command_buffers(ctx.pool, &[init_command_buffer]);
     }
-
-    drop(setup_buffers);
 
     let shader_group_count = app.create_pipeline()?;
     let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
@@ -1566,6 +1538,8 @@ fn run(args: Args) -> Result<()> {
         &output_buffer,
         Some(&output_readback),
     )?;
+
+    drop(setup_buffers);
 
     let lighting: Vec<AlignedVec3> = output_readback.load(texels.len());
     let mut lighting_lump = bsp.lump_mut(LumpDefinition::Lighting);
