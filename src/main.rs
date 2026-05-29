@@ -214,7 +214,16 @@ impl Application<'_> {
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )?;
         }
-        let delta_ticks = timestamps[1].saturating_sub(timestamps[0]);
+        
+        let valid_bits = self.ctx.timestamp_valid_bits;
+        let mask = if valid_bits >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << valid_bits) - 1
+        };
+        let start = timestamps[0] & mask;
+        let end = timestamps[1] & mask;
+        let delta_ticks = end.wrapping_sub(start) & mask;
         let time_ns =
             delta_ticks as f64 * self.ctx.physical_device_properties.limits.timestamp_period as f64;
         Ok(time_ns)

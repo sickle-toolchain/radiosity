@@ -54,6 +54,7 @@ pub struct VulkanContext {
     pub device: Device,
     pub queue: Queue,
     pub queue_family_index: u32,
+    pub timestamp_valid_bits: u32,
 
     pub pool: CommandPool,
 }
@@ -153,7 +154,7 @@ impl VulkanContext {
         let physical_device_memory_properties =
             unsafe { instance.get_physical_device_memory_properties(physical_device) };
 
-        let queue_family_index =
+        let (queue_family_index, timestamp_valid_bits) =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) }
                 .into_iter()
                 .enumerate()
@@ -163,7 +164,7 @@ impl VulkanContext {
                             .queue_flags
                             .contains(vk::QueueFlags::GRAPHICS)
                 })
-                .map(|(idx, _)| idx as u32)
+                .map(|(idx, props)| (idx as u32, props.timestamp_valid_bits))
                 .context("Failed to find queue family index")?;
 
         let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
@@ -231,6 +232,7 @@ impl VulkanContext {
             device,
             queue,
             queue_family_index,
+            timestamp_valid_bits,
 
             pool,
         })
