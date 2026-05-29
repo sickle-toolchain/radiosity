@@ -1446,7 +1446,25 @@ fn run(args: Args) -> Result<()> {
     )?;
     lights_buffer_device.cmd_copy_from(init_command_buffer, &lights_staging, lights_staging.size());
 
+    let init_to_rt_barrier = vk::MemoryBarrier::default()
+        .src_access_mask(
+            vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags::TRANSFER_WRITE,
+        )
+        .dst_access_mask(
+            vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags::SHADER_READ,
+        );
+
     unsafe {
+        ctx.device.cmd_pipeline_barrier(
+            init_command_buffer,
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+                | vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            vk::DependencyFlags::empty(),
+            &[init_to_rt_barrier],
+            &[],
+            &[],
+        );
         ctx.device.end_command_buffer(init_command_buffer)?;
         ctx.device.queue_submit(
             ctx.queue,
