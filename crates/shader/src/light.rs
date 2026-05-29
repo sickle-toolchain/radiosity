@@ -13,7 +13,7 @@ pub const INTENSITY_SCALE: f32 = 255.0;
 
 #[inline(always)]
 pub fn contribute_sky_ambient(light: &Light) -> Vec3 {
-    light.color
+    light.color.0
 }
 
 #[inline(always)]
@@ -24,7 +24,7 @@ pub fn contribute_sky_light(
     tlas: &AccelerationStructure,
     payload: &mut RayPayload,
 ) -> Vec3 {
-    let sun_dir = -light.direction;
+    let sun_dir = -light.direction.0;
     let n_dot_l = sample_normal.dot(sun_dir);
     if n_dot_l <= 0.0 {
         return Vec3::ZERO;
@@ -49,7 +49,7 @@ pub fn contribute_sky_light(
     }
 
     if matches!(payload, HitKind::Sky) {
-        light.color * INTENSITY_SCALE
+        light.color.0 * INTENSITY_SCALE
     } else {
         Vec3::ZERO
     }
@@ -57,7 +57,7 @@ pub fn contribute_sky_light(
 
 #[inline(always)]
 fn spotlight_penumbra(light: &Light, to_light: Vec3) -> Option<f32> {
-    let light_dot = (-to_light).dot(light.direction);
+    let light_dot = (-to_light).dot(light.direction.0);
 
     if light_dot < light.penumbra_end {
         return None;
@@ -105,7 +105,7 @@ pub fn contribute_positional(
     tlas: &AccelerationStructure,
     payload: &mut RayPayload,
 ) -> Vec3 {
-    let diff = sample_pos - light.position;
+    let diff = sample_pos - light.position.0;
     let dist = diff.length();
 
     if dist <= 1e-6 {
@@ -134,7 +134,7 @@ pub fn contribute_positional(
     }
 
     if light.ty == EmitType::Surface {
-        if (-to_light).dot(light.direction) < 0.0 {
+        if (-to_light).dot(light.direction.0) < 0.0 {
             return Vec3::ZERO;
         }
     }
@@ -165,5 +165,5 @@ pub fn contribute_positional(
 
     let inv_attn = distance_attenuation(light, dist);
 
-    light.color * (INTENSITY_SCALE * penumbra_scale * inv_attn)
+    light.color.0 * (INTENSITY_SCALE * penumbra_scale * inv_attn)
 }

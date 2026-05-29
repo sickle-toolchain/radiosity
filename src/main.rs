@@ -14,7 +14,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_timing::TreeTimingLayer;
 use zerocopy::IntoBytes;
 
-use ash::ext::scalar_block_layout;
 use ash::khr::{
     acceleration_structure, deferred_host_operations, get_memory_requirements2,
     ray_tracing_pipeline, spirv_1_4,
@@ -1135,7 +1134,6 @@ fn run(args: Args) -> Result<()> {
         deferred_host_operations::NAME,
         ray_tracing_pipeline::NAME,
         spirv_1_4::NAME,
-        scalar_block_layout::NAME,
         get_memory_requirements2::NAME,
         c"VK_KHR_ray_tracing_position_fetch",
     ];
@@ -1404,18 +1402,17 @@ fn run(args: Args) -> Result<()> {
         }
 
         let light = shared::Light {
-            position: Vec3::new(wl.origin[0], wl.origin[1], wl.origin[2]),
+            position: Vec3::new(wl.origin[0], wl.origin[1], wl.origin[2]).into(),
+            color: Vec3::new(color[0], color[1], color[2]).into(),
+            direction: Vec3::new(wl.normal[0], wl.normal[1], wl.normal[2]).into(),
             ty,
-            color: Vec3::new(color[0], color[1], color[2]),
             radius: color[3],
-            direction: Vec3::new(wl.normal[0], wl.normal[1], wl.normal[2]),
-            penumbra_start: wl.penumbra_start,
             constant_attn: c,
             linear_attn: l,
             quadratic_attn: q,
+            penumbra_start: wl.penumbra_start,
             penumbra_end: wl.penumbra_end,
             exponent: wl.exponent,
-            _pad: [0.0; 3],
         };
 
         tracing::info!("Light {i}: {light:?}");
@@ -1426,7 +1423,7 @@ fn run(args: Args) -> Result<()> {
     if let Some(ambient_color) = ambient_override {
         for light in lights.iter_mut() {
             if light.ty == EmitType::SkyAmbient {
-                light.color = ambient_color;
+                light.color = ambient_color.into();
             }
         }
     }

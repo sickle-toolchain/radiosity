@@ -41,18 +41,17 @@ impl TexelData {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Light {
-    pub position: Vec3,
+    pub position: AlignedVec3,
+    pub color: AlignedVec3,
+    pub direction: AlignedVec3,
     pub ty: EmitType,
-    pub color: Vec3,
     pub radius: f32,
-    pub direction: Vec3,
     pub constant_attn: f32,
     pub linear_attn: f32,
     pub quadratic_attn: f32,
     pub penumbra_start: f32,
     pub penumbra_end: f32,
     pub exponent: f32,
-    pub _pad: [f32; 3],
 }
 
 impl core::fmt::Debug for Light {
