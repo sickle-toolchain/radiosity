@@ -1120,10 +1120,8 @@ fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
     Mat3::from_cols(s_axis, t_axis, origin)
 }
 
-#[instrument(err)]
-fn run() -> Result<()> {
-    let args = Args::parse();
-
+#[instrument(skip_all, err)]
+fn run(args: Args) -> Result<()> {
     let contents = std::fs::read(args.bsp_path)?;
     let bsp = Bsp::parse(&contents).map_err(|_| anyhow!("failed to parse BSP file"))?;
 
@@ -1598,6 +1596,8 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    let args = Args::parse();
+
     let timing_layer = TreeTimingLayer::default();
 
     let env_filter = EnvFilter::try_from_default_env()
@@ -1613,7 +1613,7 @@ fn main() {
         error!("{}", panic_info.payload_as_str().unwrap_or("unknown"))
     }));
 
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(args)));
     timing_layer.print_tree(false);
 
     match result {
