@@ -182,13 +182,13 @@ impl Application<'_> {
     fn begin_timestamp_range(
         &self,
         command_buffer: vk::CommandBuffer,
-        stage: vk::PipelineStageFlags,
+        stage: vk::PipelineStageFlags2,
     ) {
         unsafe {
             self.ctx
                 .device
                 .cmd_reset_query_pool(command_buffer, self.timestamp_query_pool, 0, 2);
-            self.ctx.device.cmd_write_timestamp(
+            self.ctx.device.cmd_write_timestamp2(
                 command_buffer,
                 stage,
                 self.timestamp_query_pool,
@@ -200,10 +200,10 @@ impl Application<'_> {
     fn end_timestamp_range(
         &self,
         command_buffer: vk::CommandBuffer,
-        stage: vk::PipelineStageFlags,
+        stage: vk::PipelineStageFlags2,
     ) {
         unsafe {
-            self.ctx.device.cmd_write_timestamp(
+            self.ctx.device.cmd_write_timestamp2(
                 command_buffer,
                 stage,
                 self.timestamp_query_pool,
@@ -927,7 +927,7 @@ impl Application<'_> {
         unsafe {
             self.begin_timestamp_range(
                 self.command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             );
 
             self.ctx.device.cmd_bind_pipeline(
@@ -1023,7 +1023,7 @@ impl Application<'_> {
 
             self.end_timestamp_range(
                 self.command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
             );
 
             drop(_entered_gi);
