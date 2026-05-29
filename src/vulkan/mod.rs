@@ -171,9 +171,6 @@ impl VulkanContext {
             .queue_priorities(&[1.0])];
 
         let mut features2 = vk::PhysicalDeviceFeatures2::default();
-        unsafe {
-            instance.get_physical_device_features2(physical_device, &mut features2);
-        };
 
         let mut features12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
