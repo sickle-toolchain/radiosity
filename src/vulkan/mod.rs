@@ -188,6 +188,8 @@ impl VulkanContext {
             vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
                 .ray_tracing_position_fetch(true);
 
+        let mut features13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
+
         let enabled_extension_names = device_extensions
             .iter()
             .map(|c| c.as_ptr())
@@ -199,6 +201,7 @@ impl VulkanContext {
             .push_next(&mut acceleration_structure_features)
             .push_next(&mut raytracing_pipeline_features)
             .push_next(&mut ray_tracing_position_fetch_features)
+            .push_next(&mut features13)
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(enabled_extension_names.as_slice());
 

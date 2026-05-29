@@ -451,18 +451,15 @@ impl Application<'_> {
             )?)
         };
 
-        let upload_barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+        let upload_barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+            .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR);
         unsafe {
-            self.ctx.device.cmd_pipeline_barrier(
+            self.ctx.device.cmd_pipeline_barrier2(
                 command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::DependencyFlags::empty(),
-                &[upload_barrier],
-                &[],
-                &[],
+                &vk::DependencyInfo::default().memory_barriers(&[upload_barrier]),
             );
         }
 
@@ -505,18 +502,15 @@ impl Application<'_> {
             None
         };
 
-        let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR)
-            .dst_access_mask(vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR);
+        let barrier = vk::MemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+            .src_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR)
+            .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
+            .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR);
         unsafe {
-            self.ctx.device.cmd_pipeline_barrier(
+            self.ctx.device.cmd_pipeline_barrier2(
                 command_buffer,
-                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
+                &vk::DependencyInfo::default().memory_barriers(&[barrier]),
             );
         }
 
@@ -964,22 +958,19 @@ impl Application<'_> {
                 );
             }
 
-            let barrier = vk::BufferMemoryBarrier::default()
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            let barrier = vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(output_device.handle())
                 .offset(0)
                 .size(vk::WHOLE_SIZE);
-            self.ctx.device.cmd_pipeline_barrier(
+            self.ctx.device.cmd_pipeline_barrier2(
                 self.command_buffer,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[barrier],
-                &[],
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
             );
 
             {
@@ -1002,23 +993,20 @@ impl Application<'_> {
             let bounce_count = 1;
 
             for _bounce in 0..bounce_count {
-                let barrier = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                let barrier = vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
 
-                self.ctx.device.cmd_pipeline_barrier(
+                self.ctx.device.cmd_pipeline_barrier2(
                     self.command_buffer,
-                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[barrier],
-                    &[],
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
                 );
 
                 self.ray_tracing_pipeline_device.cmd_trace_rays(
@@ -1041,22 +1029,19 @@ impl Application<'_> {
             drop(_entered_gi);
 
             if let Some(readback) = output_readback {
-                let to_transfer = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                let to_transfer = vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier(
+                self.ctx.device.cmd_pipeline_barrier2(
                     self.command_buffer,
-                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[to_transfer],
-                    &[],
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_transfer]),
                 );
 
                 self.ctx.device.cmd_copy_buffer(
@@ -1066,40 +1051,34 @@ impl Application<'_> {
                     &[vk::BufferCopy::default().size(readback.size())],
                 );
 
-                let to_host = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::HOST_READ)
+                let to_host = vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                    .dst_access_mask(vk::AccessFlags2::HOST_READ)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(readback.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier(
+                self.ctx.device.cmd_pipeline_barrier2(
                     self.command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::HOST,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[to_host],
-                    &[],
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_host]),
                 );
             } else {
-                let to_shader = vk::BufferMemoryBarrier::default()
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                let to_shader = vk::BufferMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .buffer(output_device.handle())
                     .offset(0)
                     .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier(
+                self.ctx.device.cmd_pipeline_barrier2(
                     self.command_buffer,
-                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                    vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[to_shader],
-                    &[],
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_shader]),
                 );
             }
 
@@ -1523,24 +1502,23 @@ fn run(args: Args) -> Result<()> {
         world_buffer.cmd_copy_from(command_buffer, &world_staging, world_bytes);
     }
 
-    let init_to_rt_barrier = vk::MemoryBarrier::default()
-        .src_access_mask(
-            vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags::TRANSFER_WRITE,
+    let init_to_rt_barrier = vk::MemoryBarrier2::default()
+        .src_stage_mask(
+            vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
+                | vk::PipelineStageFlags2::ALL_TRANSFER,
         )
+        .src_access_mask(
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags2::TRANSFER_WRITE,
+        )
+        .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
         .dst_access_mask(
-            vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags::SHADER_READ,
+            vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
         );
 
     unsafe {
-        ctx.device.cmd_pipeline_barrier(
+        ctx.device.cmd_pipeline_barrier2(
             command_buffer,
-            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
-                | vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-            vk::DependencyFlags::empty(),
-            &[init_to_rt_barrier],
-            &[],
-            &[],
+            &vk::DependencyInfo::default().memory_barriers(&[init_to_rt_barrier]),
         );
     }
 
