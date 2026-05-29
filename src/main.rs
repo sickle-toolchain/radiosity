@@ -1232,10 +1232,6 @@ fn run(args: Args) -> Result<()> {
 
     let mut texels: Vec<TexelData> = Vec::new();
 
-    let verts: &[[f32; 3]] = zerocopy::transmute_ref!(&*vertices);
-
-    const NUDGE_DIST: f32 = 1.0;
-
     for face in faces.iter() {
         let plane: Ref<'_, Plane> = face.associated(&bsp);
         let normal = Vec3::from_array(plane.normal).normalize();
@@ -1253,43 +1249,9 @@ fn run(args: Args) -> Result<()> {
             base_matrix.col(2),
         );
 
-        let surface_edges: Ref<'_, [SurfaceEdge]> = face.associated(&bsp);
-        let polygon: Vec<Vec3> = surface_edges
-            .iter()
-            .map(|se| {
-                let idx = se.associated(&bsp).edge[usize::from(se.edge_index < 0)] as usize;
-                Vec3::from_array(verts[idx])
-            })
-            .collect();
-
-        let centroid = polygon.iter().copied().sum::<Vec3>() / polygon.len().max(1) as f32;
-
-        let edges: Vec<(Vec3, Vec3)> = if polygon.len() >= 3 {
-            (0..polygon.len())
-                .map(|i| {
-                    let a = polygon[i];
-                    let b = polygon[(i + 1) % polygon.len()];
-                    let edge_dir = (b - a).normalize();
-                    let n = edge_dir.cross(normal);
-                    let inward = if (centroid - a).dot(n) > 0.0 { n } else { -n };
-                    (a, inward)
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-
         for t in 0..height {
             for s in 0..width {
-                let mut world_pos = matrix * Vec3::new(s as f32, t as f32, 1f32);
-
-                for &(edge_origin, inward) in &edges {
-                    let dist = (world_pos - edge_origin).dot(inward);
-                    if dist < NUDGE_DIST {
-                        world_pos += inward * (NUDGE_DIST - dist);
-                    }
-                }
-
+                let world_pos = matrix * Vec3::new(s as f32, t as f32, 1f32);
                 texels.push(TexelData::new(world_pos, normal));
             }
         }
