@@ -18,6 +18,21 @@ use crate::vulkan::{Buffer, GeometryIndex, GeometryVertex, VulkanContext};
 
 const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
 
+#[repr(u32)]
+#[derive(Copy, Clone)]
+enum TimestampSlot {
+    SkyBegin = 0,
+    SkyEnd,
+    WorldBegin,
+    WorldEnd,
+    GiBegin,
+    GiEnd,
+}
+
+impl TimestampSlot {
+    const COUNT: u32 = Self::GiEnd as u32 + 1;
+}
+
 pub struct Application<'a> {
     pub ctx: Rc<VulkanContext>,
     pub acceleration_structure_device: acceleration_structure::Device,
@@ -83,7 +98,7 @@ impl Application<'_> {
 
         let timestamp_query_pool_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
-            .query_count(2);
+            .query_count(TimestampSlot::COUNT);
 
         let timestamp_query_pool = unsafe {
             ctx.device
@@ -125,27 +140,21 @@ impl Application<'_> {
         })
     }
 
-    fn begin_timestamp_range(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        stage: vk::PipelineStageFlags2,
-    ) {
+    fn reset_timestamp_pool(&self, command_buffer: vk::CommandBuffer) {
         unsafe {
-            self.ctx
-                .device
-                .cmd_reset_query_pool(command_buffer, self.timestamp_query_pool, 0, 2);
-            self.ctx.device.cmd_write_timestamp2(
+            self.ctx.device.cmd_reset_query_pool(
                 command_buffer,
-                stage,
                 self.timestamp_query_pool,
                 0,
+                TimestampSlot::COUNT,
             );
         }
     }
 
-    fn end_timestamp_range(
+    fn write_timestamp(
         &self,
         command_buffer: vk::CommandBuffer,
+        slot: TimestampSlot,
         stage: vk::PipelineStageFlags2,
     ) {
         unsafe {
@@ -153,34 +162,50 @@ impl Application<'_> {
                 command_buffer,
                 stage,
                 self.timestamp_query_pool,
-                1,
+                slot as u32,
             );
         }
     }
 
-    fn read_elapsed_ns(&self) -> Result<f64> {
-        let mut timestamps = [0u64; 2];
+    fn wait_timestamp(&self, slot: TimestampSlot) -> Result<()> {
+        let mut ts = [0u64; 1];
         unsafe {
             self.ctx.device.get_query_pool_results(
                 self.timestamp_query_pool,
-                0,
-                &mut timestamps,
+                slot as u32,
+                &mut ts,
                 vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT,
             )?;
         }
-        
+        Ok(())
+    }
+
+    fn elapsed_ns(&self, start: TimestampSlot, end: TimestampSlot) -> Result<f64> {
+        let mut start_ts = [0u64; 1];
+        let mut end_ts = [0u64; 1];
+        unsafe {
+            self.ctx.device.get_query_pool_results(
+                self.timestamp_query_pool,
+                start as u32,
+                &mut start_ts,
+                vk::QueryResultFlags::TYPE_64,
+            )?;
+            self.ctx.device.get_query_pool_results(
+                self.timestamp_query_pool,
+                end as u32,
+                &mut end_ts,
+                vk::QueryResultFlags::TYPE_64,
+            )?;
+        }
         let valid_bits = self.ctx.timestamp_valid_bits;
         let mask = if valid_bits >= 64 {
             u64::MAX
         } else {
             (1u64 << valid_bits) - 1
         };
-        let start = timestamps[0] & mask;
-        let end = timestamps[1] & mask;
-        let delta_ticks = end.wrapping_sub(start) & mask;
-        let time_ns =
-            delta_ticks as f64 * self.ctx.physical_device_properties.limits.timestamp_period as f64;
-        Ok(time_ns)
+        let delta_ticks = (end_ts[0] & mask).wrapping_sub(start_ts[0] & mask) & mask;
+        Ok(delta_ticks as f64
+            * self.ctx.physical_device_properties.limits.timestamp_period as f64)
     }
 
     #[instrument(skip_all)]
@@ -868,13 +893,16 @@ impl Application<'_> {
 
         let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
 
-        let gpu_span = info_span!("GPU", elapsed_ns = ::tracing::field::Empty);
+        let gpu_span = info_span!("GPU");
+        let rt_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         let entered = gpu_span.enter();
+
+        let sky_span = info_span!("PASS: Sky Illumination", elapsed_ns = ::tracing::field::Empty);
+        let world_span =
+            info_span!("PASS: World Illumination", elapsed_ns = ::tracing::field::Empty);
+        let gi_span = info_span!("PASS: Global Illumination", elapsed_ns = ::tracing::field::Empty);
         unsafe {
-            self.begin_timestamp_range(
-                self.command_buffer,
-                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-            );
+            self.reset_timestamp_pool(self.command_buffer);
 
             self.ctx.device.cmd_bind_pipeline(
                 self.command_buffer,
@@ -890,19 +918,18 @@ impl Application<'_> {
                 &[],
             );
 
-            {
-                let _span = info_span!("PASS: Sky Illumination").entered();
-                self.ray_tracing_pipeline_device.cmd_trace_rays(
-                    self.command_buffer,
-                    &sbt_raygen_region_sky,
-                    &sbt_miss_region,
-                    &sbt_hit_region,
-                    &sbt_call_region,
-                    texel_count as u32,
-                    1,
-                    1,
-                );
-            }
+            self.write_timestamp(self.command_buffer, TimestampSlot::SkyBegin, rt_stage);
+            self.ray_tracing_pipeline_device.cmd_trace_rays(
+                self.command_buffer,
+                &sbt_raygen_region_sky,
+                &sbt_miss_region,
+                &sbt_hit_region,
+                &sbt_call_region,
+                texel_count as u32,
+                1,
+                1,
+            );
+            self.write_timestamp(self.command_buffer, TimestampSlot::SkyEnd, rt_stage);
 
             let barrier = vk::BufferMemoryBarrier2::default()
                 .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
@@ -919,25 +946,21 @@ impl Application<'_> {
                 &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
             );
 
-            {
-                let _span = info_span!("PASS: World Illumination").entered();
-                self.ray_tracing_pipeline_device.cmd_trace_rays(
-                    self.command_buffer,
-                    &sbt_raygen_region_world,
-                    &sbt_miss_region,
-                    &sbt_hit_region,
-                    &sbt_call_region,
-                    texel_count as u32,
-                    1,
-                    1,
-                );
-            }
+            self.write_timestamp(self.command_buffer, TimestampSlot::WorldBegin, rt_stage);
+            self.ray_tracing_pipeline_device.cmd_trace_rays(
+                self.command_buffer,
+                &sbt_raygen_region_world,
+                &sbt_miss_region,
+                &sbt_hit_region,
+                &sbt_call_region,
+                texel_count as u32,
+                1,
+                1,
+            );
+            self.write_timestamp(self.command_buffer, TimestampSlot::WorldEnd, rt_stage);
 
-            let gi_span = info_span!("PASS: Global Illumination");
-            let _entered_gi = gi_span.enter();
-
+            self.write_timestamp(self.command_buffer, TimestampSlot::GiBegin, rt_stage);
             let bounce_count = 1;
-
             for _bounce in 0..bounce_count {
                 let barrier = vk::BufferMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
@@ -966,13 +989,7 @@ impl Application<'_> {
                     1,
                 );
             }
-
-            self.end_timestamp_range(
-                self.command_buffer,
-                vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR,
-            );
-
-            drop(_entered_gi);
+            self.write_timestamp(self.command_buffer, TimestampSlot::GiEnd, rt_stage);
 
             if let Some(readback) = output_readback {
                 let to_transfer = vk::BufferMemoryBarrier2::default()
@@ -1034,10 +1051,37 @@ impl Application<'_> {
                 &[vk::SubmitInfo::default().command_buffers(&[self.command_buffer])],
                 vk::Fence::null(),
             )?;
-            self.ctx.device.queue_wait_idle(self.ctx.queue)?;
         }
 
-        gpu_span.record("elapsed_ns", self.read_elapsed_ns()?);
+        {
+            let _e = sky_span.enter();
+            self.wait_timestamp(TimestampSlot::SkyEnd)?;
+        }
+        sky_span.record(
+            "elapsed_ns",
+            self.elapsed_ns(TimestampSlot::SkyBegin, TimestampSlot::SkyEnd)?,
+        );
+
+        {
+            let _e = world_span.enter();
+            self.wait_timestamp(TimestampSlot::WorldEnd)?;
+        }
+        world_span.record(
+            "elapsed_ns",
+            self.elapsed_ns(TimestampSlot::WorldBegin, TimestampSlot::WorldEnd)?,
+        );
+
+        {
+            let _e = gi_span.enter();
+            self.wait_timestamp(TimestampSlot::GiEnd)?;
+        }
+        gi_span.record(
+            "elapsed_ns",
+            self.elapsed_ns(TimestampSlot::GiBegin, TimestampSlot::GiEnd)?,
+        );
+
+        unsafe { self.ctx.device.queue_wait_idle(self.ctx.queue)? };
+
         drop(entered);
         Ok(())
     }
