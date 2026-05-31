@@ -93,8 +93,8 @@ impl Application<'_> {
                 );
             }
         }
-        let scratch_offset_alignment = acceleration_structure_properties
-            .min_acceleration_structure_scratch_offset_alignment;
+        let scratch_offset_alignment =
+            acceleration_structure_properties.min_acceleration_structure_scratch_offset_alignment;
 
         let timestamp_query_pool_info = vk::QueryPoolCreateInfo::default()
             .query_type(vk::QueryType::TIMESTAMP)
@@ -204,8 +204,7 @@ impl Application<'_> {
             (1u64 << valid_bits) - 1
         };
         let delta_ticks = (end_ts[0] & mask).wrapping_sub(start_ts[0] & mask) & mask;
-        Ok(delta_ticks as f64
-            * self.ctx.physical_device_properties.limits.timestamp_period as f64)
+        Ok(delta_ticks as f64 * self.ctx.physical_device_properties.limits.timestamp_period as f64)
     }
 
     #[instrument(skip_all)]
@@ -500,7 +499,7 @@ impl Application<'_> {
             transform: vk::TransformMatrixKHR {
                 matrix: identity_matrix,
             },
-            instance_custom_index_and_mask: Packed24_8::new(0, 0xFF),
+            instance_custom_index_and_mask: Packed24_8::new(0, shared::MASK_SOLID),
             instance_shader_binding_table_record_offset_and_flags: Packed24_8::new(
                 0,
                 vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
@@ -522,7 +521,7 @@ impl Application<'_> {
                 transform: vk::TransformMatrixKHR {
                     matrix: identity_matrix,
                 },
-                instance_custom_index_and_mask: Packed24_8::new(0, 0xFF),
+                instance_custom_index_and_mask: Packed24_8::new(0, shared::MASK_SKY),
                 instance_shader_binding_table_record_offset_and_flags: Packed24_8::new(
                     1,
                     vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
@@ -840,7 +839,13 @@ impl Application<'_> {
 
         unsafe {
             self.ctx.device.update_descriptor_sets(
-                &[accel_write, texel_write, output_write, world_write, sky_write],
+                &[
+                    accel_write,
+                    texel_write,
+                    output_write,
+                    world_write,
+                    sky_write,
+                ],
                 &[],
             );
         }
@@ -897,10 +902,18 @@ impl Application<'_> {
         let rt_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         let entered = gpu_span.enter();
 
-        let sky_span = info_span!("PASS: Sky Illumination", elapsed_ns = ::tracing::field::Empty);
-        let world_span =
-            info_span!("PASS: World Illumination", elapsed_ns = ::tracing::field::Empty);
-        let gi_span = info_span!("PASS: Global Illumination", elapsed_ns = ::tracing::field::Empty);
+        let sky_span = info_span!(
+            "PASS: Sky Illumination",
+            elapsed_ns = ::tracing::field::Empty
+        );
+        let world_span = info_span!(
+            "PASS: World Illumination",
+            elapsed_ns = ::tracing::field::Empty
+        );
+        let gi_span = info_span!(
+            "PASS: Global Illumination",
+            elapsed_ns = ::tracing::field::Empty
+        );
         unsafe {
             self.reset_timestamp_pool(self.command_buffer);
 

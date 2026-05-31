@@ -15,6 +15,8 @@ use spirv_std::num_traits::Float;
 
 use shared::{AlignedVec3, Light, Sky, TexelData};
 
+const SAMPLES_PER_LUXEL: u32 = 16;
+
 #[repr(u32)]
 pub enum HitKind {
     Miss,
@@ -59,9 +61,16 @@ pub fn ray_generation_sky(
     }
 
     let texel = texels[idx];
-    let result = light::contribute_sky(sky, texel.position.0, texel.normal.0, tlas, payload);
+    let normal = texel.normal.0;
 
-    output[idx] = AlignedVec3(result);
+    let mut result = Vec3::ZERO;
+    for s in 0..SAMPLES_PER_LUXEL {
+        let sample_pos = light::jittered_position(&texel, s, SAMPLES_PER_LUXEL);
+        result +=
+            light::contribute_sky(sky, sample_pos, normal, tlas, payload, s, SAMPLES_PER_LUXEL);
+    }
+
+    output[idx] = AlignedVec3(result * (1.0 / SAMPLES_PER_LUXEL as f32));
 }
 
 #[spirv(ray_generation)]
@@ -80,17 +89,17 @@ pub fn ray_generation_world(
     }
 
     let texel = texels[idx];
-    let sample_pos: Vec3 = texel.position.0;
-    let sample_normal: Vec3 = texel.normal.0;
+    let normal = texel.normal.0;
 
-    let mut result = output[idx].0;
-
-    for i in 0..lights.len() {
-        result +=
-            light::contribute_positional(&lights[i], sample_pos, sample_normal, tlas, payload);
+    let mut result = Vec3::ZERO;
+    for s in 0..SAMPLES_PER_LUXEL {
+        let sample_pos = light::jittered_position(&texel, s, SAMPLES_PER_LUXEL);
+        for i in 0..lights.len() {
+            result += light::contribute_positional(&lights[i], sample_pos, normal, tlas, payload);
+        }
     }
 
-    output[idx] = AlignedVec3(result);
+    output[idx] = AlignedVec3(output[idx].0 + result * (1.0 / SAMPLES_PER_LUXEL as f32));
 }
 
 #[spirv(ray_generation)]

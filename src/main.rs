@@ -22,8 +22,8 @@ use spirv_std::glam::{Mat3, Vec3};
 
 use bsp::Bsp;
 use lump_definitions::source::{
-    ColorRGBExp32, EmitType, Face, LumpDefinition, Plane, SurfaceEdge, SurfaceFlags, TextureInfo,
-    Vertex, WorldLight,
+    Brush, BrushSide, ColorRGBExp32, EmitType, Face, Leaf, LumpDefinition, MASK_OPAQUE, Model,
+    Node, Plane, SurfaceEdge, SurfaceFlags, TextureInfo, Vertex, WorldLight,
 };
 
 use radiosity::vulkan::{Buffer, VulkanContext};
@@ -120,11 +120,30 @@ fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
     Mat3::from_cols(s_axis, t_axis, origin)
 }
 
+const NON_LIT_SURFACE_FLAGS: u16 = SurfaceFlags::SKY
+    | SurfaceFlags::SKY2D
+    | SurfaceFlags::NOLIGHT
+    | SurfaceFlags::NODRAW
+    | SurfaceFlags::HINT
+    | SurfaceFlags::SKIP;
+
+fn is_lightmapped<'a>(face: &Face, bsp: &'a Bsp<'a>) -> bool {
+    if face.texture_info_index < 0 {
+        return false;
+    }
+    let tex: Ref<'_, TextureInfo> = face.associated(bsp);
+    (tex.flags as u16) & NON_LIT_SURFACE_FLAGS == 0
+}
+
 #[instrument(skip_all)]
 fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face], lightmap_scale: u32) -> Vec<TexelData> {
     let mut texels = Vec::new();
 
     for face in faces {
+        if !is_lightmapped(face, bsp) {
+            continue;
+        }
+
         let plane: Ref<'_, Plane> = face.associated(bsp);
         let normal = Vec3::from_array(plane.normal).normalize();
 
@@ -138,11 +157,13 @@ fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face], lightmap_scale: u32) ->
             base_matrix.col(1) * inv_scale,
             base_matrix.col(2),
         );
+        let tangent = matrix.col(0);
+        let bitangent = matrix.col(1);
 
         for t in 0..height {
             for s in 0..width {
                 let world_pos = matrix * Vec3::new(s as f32, t as f32, 1f32);
-                texels.push(TexelData::new(world_pos, normal));
+                texels.push(TexelData::new(world_pos, normal, tangent, bitangent));
             }
         }
     }
@@ -150,55 +171,222 @@ fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face], lightmap_scale: u32) ->
     texels
 }
 
-#[instrument(skip_all)]
-fn collect_geometry<'a>(bsp: &'a Bsp<'a>, faces: &[Face]) -> (Vec<u16>, Vec<u16>) {
-    const INVISIBLE_FLAGS: u16 =
-        SurfaceFlags::NODRAW | SurfaceFlags::TRIGGER | SurfaceFlags::HINT | SurfaceFlags::SKIP;
-    const SKY_FLAGS: u16 = SurfaceFlags::SKY | SurfaceFlags::SKY2D;
+fn base_winding_into(normal: Vec3, dist: f32, out: &mut Vec<Vec3>) {
+    let abs_n = normal.abs();
+    let axis = if abs_n.x > abs_n.y && abs_n.x > abs_n.z {
+        Vec3::Y
+    } else if abs_n.y > abs_n.z {
+        Vec3::Z
+    } else {
+        Vec3::X
+    };
 
-    let category = |face: &Face| -> u8 {
-        let tex: Ref<'_, TextureInfo> = face.associated(bsp);
-        let flags = tex.flags as u16;
-        if flags & INVISIBLE_FLAGS != 0 {
-            0 // invisible
-        } else if flags & SKY_FLAGS != 0 {
-            2 // sky face
+    let tangent = (axis - normal * normal.dot(axis)).normalize();
+    let bitangent = normal.cross(tangent);
+    let center = normal * dist;
+
+    const HALF_SIZE: f32 = 65536.0;
+    out.clear();
+    out.extend([
+        center + tangent * HALF_SIZE + bitangent * HALF_SIZE,
+        center - tangent * HALF_SIZE + bitangent * HALF_SIZE,
+        center - tangent * HALF_SIZE - bitangent * HALF_SIZE,
+        center + tangent * HALF_SIZE - bitangent * HALF_SIZE,
+    ]);
+}
+
+fn chop_winding_into(winding: &[Vec3], normal: Vec3, dist: f32, epsilon: f32, out: &mut Vec<Vec3>) {
+    out.clear();
+    if winding.is_empty() {
+        return;
+    }
+    let n = winding.len();
+    let mut prev = winding[n - 1];
+    let mut prev_signed = prev.dot(normal) - dist;
+    let mut prev_in = prev_signed >= -epsilon;
+    for &curr in winding {
+        let curr_signed = curr.dot(normal) - dist;
+        let curr_in = curr_signed >= -epsilon;
+        if prev_in != curr_in {
+            let t = prev_signed / (prev_signed - curr_signed);
+            out.push(prev + (curr - prev) * t);
+        }
+        if curr_in {
+            out.push(curr);
+        }
+        prev = curr;
+        prev_signed = curr_signed;
+        prev_in = curr_in;
+    }
+}
+
+fn emit_polygon(
+    vertices: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    polygon: impl IntoIterator<Item = [f32; 3]>,
+) {
+    let base = vertices.len() as u32;
+    vertices.extend(polygon);
+    let count = vertices.len() as u32 - base;
+    indices.extend((2..count).flat_map(|k| [base, base + k - 1, base + k]));
+}
+
+fn collect_worldspawn_brush_indices<'a>(
+    bsp: &'a Bsp<'a>,
+) -> Result<std::collections::HashSet<u32>> {
+    let models: Ref<'_, [Model]> = bsp.get_lump(LumpDefinition::Models)?;
+    let nodes: Ref<'_, [Node]> = bsp.get_lump(LumpDefinition::Nodes)?;
+    let leaves: Ref<'_, [Leaf]> = bsp.get_lump(LumpDefinition::Leaves)?;
+    let leaf_brushes: Ref<'_, [u16]> = bsp.get_lump(LumpDefinition::LeafBrushes)?;
+
+    let worldspawn_root = models
+        .first()
+        .context("BSP has no models lump entries")?
+        .head_node;
+
+    let mut result = std::collections::HashSet::new();
+    let mut stack = vec![worldspawn_root];
+    while let Some(child) = stack.pop() {
+        if child >= 0 {
+            let node = &nodes[child as usize];
+            stack.push(node.children[0]);
+            stack.push(node.children[1]);
         } else {
-            1 // solid
-        }
-    };
+            let leaf_idx = !child as usize;
+            let leaf = &leaves[leaf_idx];
+            let first = leaf.first_leaf_brush as usize;
+            let count = leaf.num_leaf_brushes as usize;
 
-    let triangulate = |face: &Face| -> Vec<u16> {
-        let surface_edges: Ref<'_, [SurfaceEdge]> = face.associated(bsp);
-        let mut it = surface_edges.iter().map(|surface_edge| {
-            surface_edge.associated(bsp).edge[usize::from(surface_edge.edge_index < 0)]
-        });
-        let mut tris = Vec::new();
-        let Some(pivot) = it.next() else { return tris };
-        let Some(mut prev) = it.next() else {
-            return tris;
-        };
-        for current in it {
-            tris.extend([pivot, prev, current]);
-            prev = current;
-        }
-        tris
-    };
-
-    let mut solid_indices = Vec::new();
-    let mut sky_indices = Vec::new();
-    for face in faces {
-        match category(face) {
-            1 => solid_indices.extend(triangulate(face)),
-            2 => sky_indices.extend(triangulate(face)),
-            _ => {}
+            result.extend(
+                leaf_brushes[first..first + count]
+                    .iter()
+                    .map(|&b| u32::from(b)),
+            );
         }
     }
-    (solid_indices, sky_indices)
+    Ok(result)
+}
+
+#[instrument(skip_all)]
+fn collect_brush_geometry<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<[f32; 3]>, Vec<u32>)> {
+    let brushes: Ref<'_, [Brush]> = bsp.get_lump(LumpDefinition::Brushes)?;
+    let sides: Ref<'_, [BrushSide]> = bsp.get_lump(LumpDefinition::BrushSides)?;
+    let planes: Ref<'_, [Plane]> = bsp.get_lump(LumpDefinition::Planes)?;
+    let texinfos: Ref<'_, [TextureInfo]> = bsp.get_lump(LumpDefinition::TextureInfo)?;
+    let worldspawn_brushes = collect_worldspawn_brush_indices(bsp)?;
+
+    const CHOP_EPSILON: f32 = 0.1;
+    let mut vertices: Vec<[f32; 3]> = Vec::new();
+    let mut indices: Vec<u32> = Vec::new();
+
+    let mut winding: Vec<Vec3> = Vec::new();
+    let mut scratch: Vec<Vec3> = Vec::new();
+
+    for (brush_idx, brush) in brushes.iter().enumerate() {
+        if !worldspawn_brushes.contains(&(brush_idx as u32)) {
+            continue;
+        }
+        if brush.contents & MASK_OPAQUE == 0 {
+            continue;
+        }
+        let first = brush.first_side as usize;
+        let count = brush.num_sides as usize;
+
+        for i in 0..count {
+            let side = &sides[first + i];
+            if side.disp_info != 0 {
+                continue;
+            }
+            if side.tex_info < 0 {
+                continue;
+            }
+            let tex = &texinfos[side.tex_info as usize];
+            if (tex.flags as u16) & SurfaceFlags::SKY != 0 {
+                continue;
+            }
+
+            let plane = &planes[side.plane_num as usize];
+            let normal = Vec3::from_array(plane.normal);
+            base_winding_into(normal, plane.dist, &mut winding);
+
+            for j in 0..count {
+                if i == j {
+                    continue;
+                }
+                let other = &sides[first + j];
+                if other.bevel != 0 {
+                    continue;
+                }
+                let other_plane = &planes[other.plane_num as usize];
+                let inward_normal = -Vec3::from_array(other_plane.normal);
+                let inward_dist = -other_plane.dist;
+                chop_winding_into(
+                    &winding,
+                    inward_normal,
+                    inward_dist,
+                    CHOP_EPSILON,
+                    &mut scratch,
+                );
+                std::mem::swap(&mut winding, &mut scratch);
+                if winding.len() < 3 {
+                    break;
+                }
+            }
+
+            if winding.len() < 3 {
+                continue;
+            }
+
+            emit_polygon(
+                &mut vertices,
+                &mut indices,
+                winding.iter().map(|v| v.to_array()),
+            );
+        }
+    }
+
+    Ok((vertices, indices))
+}
+
+#[instrument(skip_all)]
+fn collect_sky_geometry<'a>(
+    bsp: &'a Bsp<'a>,
+    faces: &[Face],
+    vertices: &mut Vec<[f32; 3]>,
+) -> Result<Vec<u32>> {
+    const SKY_FLAGS: u16 = SurfaceFlags::SKY | SurfaceFlags::SKY2D;
+
+    let positions: Ref<'_, [Vertex]> = bsp.get_lump(LumpDefinition::Vertices)?;
+    let positions: &[[f32; 3]] = zerocopy::transmute_ref!(&*positions);
+
+    let mut indices = Vec::new();
+    for face in faces {
+        let tex: Ref<'_, TextureInfo> = face.associated(bsp);
+        if (tex.flags as u16) & SKY_FLAGS == 0 {
+            continue;
+        }
+
+        let surface_edges: Ref<'_, [SurfaceEdge]> = face.associated(bsp);
+        if surface_edges.len() < 3 {
+            continue;
+        }
+
+        emit_polygon(
+            vertices,
+            &mut indices,
+            surface_edges.iter().map(|surface_edge| {
+                let edge = surface_edge.associated(bsp).edge;
+                positions[edge[usize::from(surface_edge.edge_index < 0)] as usize]
+            }),
+        );
+    }
+    Ok(indices)
 }
 
 #[instrument(skip_all)]
 fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::Sky)> {
+    const LUMP_INTENSITY_SCALE: f32 = 255.0;
+
     let entity_string = {
         let entity_lump = bsp.lump(LumpDefinition::Entities);
         String::from_utf8_lossy(&entity_lump.data).into_owned()
@@ -206,29 +394,30 @@ fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::S
     let entities = valve_kv::parse(&entity_string).unwrap_or_default();
 
     let mut ambient_override: Option<Vec3> = None;
-    for ent in &entities {
-        if ent.properties.get("classname") == Some(&"light_environment") {
-            if let Some(ambient_str) = ent.properties.get("_ambient") {
-                let parts: Vec<f32> = ambient_str
-                    .split_whitespace()
-                    .filter_map(|s| s.parse().ok())
-                    .collect();
-                if parts.len() >= 4 {
-                    let scale = parts[3] / 255.0;
-                    ambient_override = Some(Vec3::new(
-                        parts[0] * scale,
-                        parts[1] * scale,
-                        parts[2] * scale,
-                    ));
-                }
+    let mut sun_spread = 0.0_f32;
+    if let Some(env) = entities
+        .iter()
+        .find(|ent| ent.properties.get("classname") == Some(&"light_environment"))
+    {
+        if let Some(ambient_str) = env.properties.get("_ambient") {
+            let parts: Vec<f32> = ambient_str
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            if parts.len() >= 4 {
+                let scale = parts[3] / 255.0;
+                ambient_override = Some(Vec3::new(
+                    parts[0] * scale,
+                    parts[1] * scale,
+                    parts[2] * scale,
+                ));
             }
-            if let Some(spread) = ent.properties.get("SunSpreadAngle") {
-                if let Ok(angle) = spread.parse::<f32>() {
-                    let extent = (angle.to_radians()).sin();
-                    info!("Sun angular extent from entity: {extent}");
-                }
+        }
+        if let Some(spread) = env.properties.get("SunSpreadAngle") {
+            if let Ok(angle) = spread.parse::<f32>() {
+                sun_spread = angle.to_radians().sin();
+                info!("Sun angular radius (sin): {sun_spread}");
             }
-            break;
         }
     }
 
@@ -241,11 +430,15 @@ fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::S
 
     for (i, wl) in worldlights.iter().enumerate() {
         let Ok(ty) = EmitType::try_from(wl.ty) else {
-            warn!("Light {} is an unsupported type ({}) and was skipped.", i, wl.ty);
+            warn!(
+                "Light {} is an unsupported type ({}) and was skipped.",
+                i, wl.ty
+            );
             continue;
         };
 
-        let color = Vec3::new(wl.intensity[0], wl.intensity[1], wl.intensity[2]);
+        let color =
+            Vec3::new(wl.intensity[0], wl.intensity[1], wl.intensity[2]) * LUMP_INTENSITY_SCALE;
 
         match ty {
             EmitType::SkyLight => {
@@ -302,8 +495,7 @@ fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::S
     if let Some(ambient_color) = ambient_override {
         sky.ambient_color = ambient_color.into();
     }
-
-    info!("Sky: {sky:?}");
+    sky.sun_spread = sun_spread;
 
     Ok((world_lights, sky))
 }
@@ -333,7 +525,11 @@ fn encode_rgbexp32(color: Vec3) -> ColorRGBExp32 {
 }
 
 #[instrument(skip_all)]
-fn write_lightmap<'a>(bsp: &'a Bsp<'a>, lighting: &[AlignedVec3], lightmap_scale: u32) -> Result<()> {
+fn write_lightmap<'a>(
+    bsp: &'a Bsp<'a>,
+    lighting: &[AlignedVec3],
+    lightmap_scale: u32,
+) -> Result<()> {
     let mut faces = bsp.get_lump_mut::<[Face]>(LumpDefinition::Faces)?;
     let mut faces_hdr = bsp.get_lump_mut::<[Face]>(LumpDefinition::FacesHdr).ok();
 
@@ -366,6 +562,16 @@ fn write_lightmap<'a>(bsp: &'a Bsp<'a>, lighting: &[AlignedVec3], lightmap_scale
     let mut texel_offset = 0usize;
 
     for (i, face) in faces.iter_mut().enumerate() {
+        if !is_lightmapped(face, bsp) {
+            face.light_offset = -1;
+            if let Some(hdr_faces) = &mut faces_hdr
+                && let Some(hdr_face) = hdr_faces.get_mut(i)
+            {
+                hdr_face.light_offset = -1;
+            }
+            continue;
+        }
+
         let width = ((face.lightmap.maxs[0] + 1) as u32 * lightmap_scale) as usize;
         let height = ((face.lightmap.maxs[1] + 1) as u32 * lightmap_scale) as usize;
         let luxel_count = width * height;
@@ -443,7 +649,6 @@ fn run(args: Args) -> Result<()> {
     )?);
     let mut app = Application::new(ctx.clone())?;
 
-    let vertices = bsp.get_lump::<[Vertex]>(LumpDefinition::Vertices)?;
     let faces = bsp.get_lump::<[Face]>(LumpDefinition::Faces)?;
 
     let texels = generate_texels(&bsp, &faces, args.lightmap_scale);
@@ -495,17 +700,17 @@ fn run(args: Args) -> Result<()> {
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
     )?;
 
-    let (solid_indices, sky_indices) = collect_geometry(&bsp, &faces);
+    let (mut geometry_vertices, solid_indices) = collect_brush_geometry(&bsp)?;
+    let sky_indices = collect_sky_geometry(&bsp, &faces, &mut geometry_vertices)?;
     info!(
         "Geometry: {} solid triangles, {} sky triangles",
         solid_indices.len() / 3,
         sky_indices.len() / 3
     );
 
-    let vertices: &[[f32; 3]] = zerocopy::transmute_ref!(&*vertices);
     let setup_buffers = app.create_acceleration_structures(
         command_buffer,
-        vertices,
+        &geometry_vertices,
         &solid_indices,
         &sky_indices,
     )?;
@@ -573,12 +778,7 @@ fn run(args: Args) -> Result<()> {
     let shader_group_count = app.create_pipeline()?;
     let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
 
-    app.create_descriptor_set(
-        &texel_buffer,
-        &output_buffer,
-        &sky_buffer,
-        &world_buffer,
-    )?;
+    app.create_descriptor_set(&texel_buffer, &output_buffer, &sky_buffer, &world_buffer)?;
     app.record_ray_tracing(
         sbt_handle_size,
         texels.len(),

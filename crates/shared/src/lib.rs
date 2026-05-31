@@ -6,6 +6,10 @@ use core::convert::Into;
 pub use lump_definitions::source::EmitType;
 use spirv_std::glam::Vec3;
 
+pub const MASK_SOLID: u8 = 0x01;
+pub const MASK_SKY: u8 = 0x02;
+pub const MASK_ALL: u8 = MASK_SOLID | MASK_SKY;
+
 #[repr(C, align(16))]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct AlignedVec3(pub Vec3);
@@ -27,13 +31,17 @@ impl From<AlignedVec3> for Vec3 {
 pub struct TexelData {
     pub position: AlignedVec3,
     pub normal: AlignedVec3,
+    pub tangent: AlignedVec3,
+    pub bitangent: AlignedVec3,
 }
 
 impl TexelData {
-    pub fn new(position: Vec3, normal: Vec3) -> Self {
+    pub fn new(position: Vec3, normal: Vec3, tangent: Vec3, bitangent: Vec3) -> Self {
         Self {
             position: position.into(),
             normal: normal.into(),
+            tangent: tangent.into(),
+            bitangent: bitangent.into(),
         }
     }
 }
@@ -81,6 +89,8 @@ pub struct Sky {
     pub sun_direction: AlignedVec3,
     pub sun_color: AlignedVec3,
     pub ambient_color: AlignedVec3,
+    pub sun_spread: f32,
+    pub _pad: [f32; 3],
 }
 
 #[repr(C)]
