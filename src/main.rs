@@ -389,9 +389,17 @@ fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::S
 
     let entity_string = {
         let entity_lump = bsp.lump(LumpDefinition::Entities);
-        String::from_utf8_lossy(&entity_lump.data).into_owned()
+        let raw = String::from_utf8_lossy(&entity_lump.data);
+        let end = raw.find('\0').unwrap_or(raw.len());
+        raw[..end].to_owned()
     };
-    let entities = valve_kv::parse(&entity_string).unwrap_or_default();
+    let entities = match valve_kv::parse(&entity_string) {
+        Ok(entities) => entities,
+        Err(e) => {
+            warn!("failed to parse entity lump: {e}");
+            Vec::new()
+        }
+    };
 
     let mut ambient_override: Option<Vec3> = None;
     let mut sun_spread = 0.0_f32;
