@@ -7,29 +7,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let shader_crate_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("crates")
         .join("shader");
-    println!(
-        "cargo::rerun-if-changed={}",
-        shader_crate_path.join("Cargo.toml").display()
-    );
-    println!(
-        "cargo::rerun-if-changed={}",
-        shader_crate_path.join("src").join("lib.rs").display()
-    );
-    println!(
-        "cargo::rerun-if-changed={}",
-        shader_crate_path.join("src").join("light.rs").display()
-    );
 
-    let shared_lib = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("crates")
-        .join("shared")
-        .join("src")
-        .join("lib.rs");
-    println!("cargo::rerun-if-changed={}", shared_lib.display());
-
-    
-    
-    
     unsafe {
         std::env::set_var(
             "RUSTGPU_RUSTFLAGS",
