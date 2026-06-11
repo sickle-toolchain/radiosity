@@ -16,7 +16,11 @@ use ash::vk::{
 
 use crate::vulkan::{Buffer, GeometryIndex, GeometryVertex, VulkanContext};
 
-const SHADER: &[u8] = include_bytes!(env!("radiosity_shader.spv"));
+#[repr(align(4))]
+struct AlignedSpirv<T: ?Sized>(T);
+
+static SHADER: &AlignedSpirv<[u8]> =
+    &AlignedSpirv(*include_bytes!(env!("radiosity_shader.spv")));
 
 #[repr(u32)]
 #[derive(Copy, Clone)]
@@ -607,8 +611,8 @@ impl Application<'_> {
             s_type: vk::StructureType::SHADER_MODULE_CREATE_INFO,
             p_next: ptr::null(),
             flags: vk::ShaderModuleCreateFlags::empty(),
-            code_size: SHADER.len(),
-            p_code: SHADER.as_ptr().cast(),
+            code_size: SHADER.0.len(),
+            p_code: SHADER.0.as_ptr().cast(),
             ..Default::default()
         };
 
