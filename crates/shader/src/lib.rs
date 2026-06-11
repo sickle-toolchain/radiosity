@@ -28,7 +28,6 @@ pub type RayPayload = HitKind;
 
 #[spirv(miss)]
 pub fn miss(#[spirv(incoming_ray_payload)] payload: &mut RayPayload) {
-    // TODO: Can we just remove the miss function?
     *payload = HitKind::Miss;
     black_box(())
 }

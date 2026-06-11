@@ -254,7 +254,9 @@ pub fn contribute_positional(
     *payload = HitKind::Hit;
     unsafe {
         tlas.trace_ray(
-            RayFlags::OPAQUE | RayFlags::TERMINATE_ON_FIRST_HIT,
+            RayFlags::OPAQUE
+                | RayFlags::TERMINATE_ON_FIRST_HIT
+                | RayFlags::SKIP_CLOSEST_HIT_SHADER,
             MASK_SOLID as i32,
             0,
             0,
