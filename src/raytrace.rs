@@ -429,7 +429,9 @@ impl Application<'_> {
             .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
             .dst_stage_mask(vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR)
-            .dst_access_mask(vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR);
+            .dst_access_mask(
+                vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
+            );
         unsafe {
             self.ctx.device.cmd_pipeline_barrier2(
                 command_buffer,
