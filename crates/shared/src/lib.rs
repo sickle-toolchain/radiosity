@@ -10,6 +10,17 @@ pub const MASK_SOLID: u8 = 0x01;
 pub const MASK_SKY: u8 = 0x02;
 pub const MASK_ALL: u8 = MASK_SOLID | MASK_SKY;
 
+/// TLAS instance indices
+pub const INSTANCE_SOLID: u32 = 0;
+pub const INSTANCE_SKY: u32 = 1;
+
+/// Workgroup size
+pub const COMPUTE_WORKGROUP_SIZE: u32 = 64;
+
+/// Workgroups along x per dispatch
+pub const COMPUTE_X_GROUPS: u32 = 1024;
+pub const COMPUTE_X_STRIDE: u32 = COMPUTE_WORKGROUP_SIZE * COMPUTE_X_GROUPS;
+
 #[repr(C, align(16))]
 #[derive(Default, Clone, Copy, Debug)]
 pub struct AlignedVec3(pub Vec3);
@@ -91,12 +102,4 @@ pub struct Sky {
     pub ambient_color: AlignedVec3,
     pub sun_spread: f32,
     pub _pad: [f32; 3],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct RayPayload {
-    pub hit_pos: Vec3,
-    pub hit_normal: Vec3,
-    pub hit: u32,
 }

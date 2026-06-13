@@ -8,17 +8,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         .join("crates")
         .join("shader");
 
-    unsafe {
-        std::env::set_var(
-            "RUSTGPU_RUSTFLAGS",
-            "-Ctarget-feature=+RayTracingPositionFetchKHR",
-        );
-    }
-
     let mut builder = SpirvBuilder::new(shader_crate_path, "spirv-unknown-vulkan1.3")
-        .extension("SPV_KHR_ray_tracing")
-        .extension("SPV_KHR_ray_tracing_position_fetch")
-        .capability(Capability::RayTracingKHR)
+        .extension("SPV_KHR_ray_query")
+        .capability(Capability::RayQueryKHR)
         .preserve_bindings(true);
 
     builder.build_script.defaults = true;

@@ -3,15 +3,14 @@
 use std::ptr;
 use std::rc::Rc;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tracing::{info_span, instrument};
 
-use ash::khr::{acceleration_structure, ray_tracing_pipeline};
+use ash::khr::acceleration_structure;
 use ash::vk::{
     self, AccelerationStructureBuildRangeInfoKHR, AccelerationStructureGeometryKHR,
     AccelerationStructureKHR, AccelerationStructureTypeKHR, BufferUsageFlags,
-    BuildAccelerationStructureFlagsKHR, MemoryPropertyFlags, Packed24_8,
-    PhysicalDeviceRayTracingPipelinePropertiesKHR, QueryPool,
+    BuildAccelerationStructureFlagsKHR, MemoryPropertyFlags, Packed24_8, QueryPool,
 };
 
 use crate::vulkan::{Buffer, GeometryIndex, GeometryVertex, VulkanContext};
@@ -19,8 +18,7 @@ use crate::vulkan::{Buffer, GeometryIndex, GeometryVertex, VulkanContext};
 #[repr(align(4))]
 struct AlignedSpirv<T: ?Sized>(T);
 
-static SHADER: &AlignedSpirv<[u8]> =
-    &AlignedSpirv(*include_bytes!(env!("radiosity_shader.spv")));
+static SHADER: &AlignedSpirv<[u8]> = &AlignedSpirv(*include_bytes!(env!("radiosity_shader.spv")));
 
 #[repr(u32)]
 #[derive(Copy, Clone)]
@@ -29,19 +27,15 @@ enum TimestampSlot {
     SkyEnd,
     WorldBegin,
     WorldEnd,
-    GiBegin,
-    GiEnd,
 }
 
 impl TimestampSlot {
-    const COUNT: u32 = Self::GiEnd as u32 + 1;
+    const COUNT: u32 = Self::WorldEnd as u32 + 1;
 }
 
-pub struct Application<'a> {
+pub struct Application {
     pub ctx: Rc<VulkanContext>,
     pub acceleration_structure_device: acceleration_structure::Device,
-    pub ray_tracing_pipeline_device: ray_tracing_pipeline::Device,
-    pub ray_tracing_pipeline_properties: PhysicalDeviceRayTracingPipelinePropertiesKHR<'a>,
 
     pub scratch_offset_alignment: u32,
 
@@ -59,35 +53,23 @@ pub struct Application<'a> {
     pub vertex_buffer: Option<Buffer>,
     pub index_buffer: Option<Buffer>,
     pub pipeline_layout: vk::PipelineLayout,
-    pub pipeline: vk::Pipeline,
-    pub shader_binding_table_buffer: Option<Buffer>,
+    pub compute_sky_pipeline: vk::Pipeline,
+    pub compute_world_pipeline: vk::Pipeline,
 
     pub command_buffer: vk::CommandBuffer,
 
     pub timestamp_query_pool: QueryPool,
 }
 
-impl Application<'_> {
-    pub const SBT_GROUP_RAYGEN_SKY: u32 = 0;
-    pub const SBT_GROUP_RAYGEN_WORLD: u32 = 1;
-    pub const SBT_GROUP_RAYGEN_GI: u32 = 2;
-    pub const SBT_GROUP_MISS: u32 = 3;
-    pub const SBT_GROUP_HIT: u32 = 4;
-    pub const SBT_GROUP_SKY_HIT: u32 = 5;
-
+impl Application {
     pub fn new(ctx: Rc<VulkanContext>) -> Result<Self> {
         let acceleration_structure_device =
             acceleration_structure::Device::new(&ctx.instance, &ctx.device);
-        let ray_tracing_pipeline_device =
-            ray_tracing_pipeline::Device::new(&ctx.instance, &ctx.device);
 
-        let mut ray_tracing_pipeline_properties =
-            PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
         let mut acceleration_structure_properties =
             vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
         {
             let mut physical_device_properties2 = vk::PhysicalDeviceProperties2::default()
-                .push_next(&mut ray_tracing_pipeline_properties)
                 .push_next(&mut acceleration_structure_properties);
 
             unsafe {
@@ -120,8 +102,6 @@ impl Application<'_> {
         Ok(Self {
             ctx,
             acceleration_structure_device,
-            ray_tracing_pipeline_device,
-            ray_tracing_pipeline_properties,
             scratch_offset_alignment,
             timestamp_query_pool,
             descriptor_set_layout: vk::DescriptorSetLayout::null(),
@@ -138,8 +118,8 @@ impl Application<'_> {
             index_buffer: None,
 
             pipeline_layout: vk::PipelineLayout::null(),
-            pipeline: vk::Pipeline::null(),
-            shader_binding_table_buffer: None,
+            compute_sky_pipeline: vk::Pipeline::null(),
+            compute_world_pipeline: vk::Pipeline::null(),
             command_buffer,
         })
     }
@@ -451,8 +431,7 @@ impl Application<'_> {
             &[solid_geometry],
             &[vk::AccelerationStructureBuildRangeInfoKHR::default()
                 .primitive_count(solid_indices.len() as u32 / 3)],
-            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
-                | vk::BuildAccelerationStructureFlagsKHR::ALLOW_DATA_ACCESS,
+            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE,
         )?;
         temp_buffers.push(solid_scratch);
 
@@ -501,7 +480,10 @@ impl Application<'_> {
                 )
         };
 
-        let mut instances = vec![vk::AccelerationStructureInstanceKHR {
+        let mut instances = Vec::new();
+        debug_assert_eq!(instances.len() as u32, shared::INSTANCE_SOLID);
+
+        instances.push(vk::AccelerationStructureInstanceKHR {
             transform: vk::TransformMatrixKHR {
                 matrix: identity_matrix,
             },
@@ -513,7 +495,7 @@ impl Application<'_> {
             acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
                 device_handle: solid_device_handle,
             },
-        }];
+        });
 
         if let Some((sky_blas, _)) = &sky_blas_opt {
             let sky_device_handle = unsafe {
@@ -523,13 +505,14 @@ impl Application<'_> {
                             .acceleration_structure(*sky_blas),
                     )
             };
+            debug_assert_eq!(instances.len() as u32, shared::INSTANCE_SKY);
             instances.push(vk::AccelerationStructureInstanceKHR {
                 transform: vk::TransformMatrixKHR {
                     matrix: identity_matrix,
                 },
                 instance_custom_index_and_mask: Packed24_8::new(0, shared::MASK_SKY),
                 instance_shader_binding_table_record_offset_and_flags: Packed24_8::new(
-                    1,
+                    0,
                     vk::GeometryInstanceFlagsKHR::TRIANGLE_FACING_CULL_DISABLE.as_raw() as u8,
                 ),
                 acceleration_structure_reference: vk::AccelerationStructureReferenceKHR {
@@ -566,35 +549,27 @@ impl Application<'_> {
     }
 
     #[instrument(skip_all)]
-    pub fn create_pipeline(&mut self) -> Result<usize> {
+    pub fn create_pipelines(&mut self) -> Result<()> {
+        let storage_binding = |binding: u32| {
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+        };
+
         self.descriptor_set_layout = unsafe {
             self.ctx.device.create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default().bindings(&[
                     vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
                         .descriptor_count(1)
                         .descriptor_type(vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)
-                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR)
-                        .binding(0),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(1)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(2)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(3)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
-                    vk::DescriptorSetLayoutBinding::default()
-                        .binding(4)
-                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::RAYGEN_KHR),
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE),
+                    storage_binding(1),
+                    storage_binding(2),
+                    storage_binding(3),
+                    storage_binding(4),
                 ]),
                 None,
             )
@@ -624,126 +599,39 @@ impl Application<'_> {
                 .create_shader_module(&shader_module_create_info, None)
         }?;
 
-        let general_group = |shader: u32| {
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(shader)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR)
-        };
-        let hit_group = |closest_hit: u32| {
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(closest_hit)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR)
-        };
+        let sky_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(c"compute_sky");
+        let world_stage = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::COMPUTE)
+            .module(shader_module)
+            .name(c"compute_world");
 
-        let shader_groups = vec![
-            general_group(Self::SBT_GROUP_RAYGEN_SKY),
-            general_group(Self::SBT_GROUP_RAYGEN_WORLD),
-            general_group(Self::SBT_GROUP_RAYGEN_GI),
-            general_group(Self::SBT_GROUP_MISS),
-            hit_group(Self::SBT_GROUP_HIT),
-            hit_group(Self::SBT_GROUP_SKY_HIT),
-        ];
-
-        let shader_stages = vec![
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                .module(shader_module)
-                .name(c"ray_generation_sky"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                .module(shader_module)
-                .name(c"ray_generation_world"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                .module(shader_module)
-                .name(c"ray_generation_gi"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MISS_KHR)
-                .module(shader_module)
-                .name(c"miss"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                .module(shader_module)
-                .name(c"closest_hit"),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                .module(shader_module)
-                .name(c"sky_hit"),
-        ];
-
-        let pipeline_result = unsafe {
-            self.ray_tracing_pipeline_device
-                .create_ray_tracing_pipelines(
-                    vk::DeferredOperationKHR::null(),
-                    vk::PipelineCache::null(),
-                    &[vk::RayTracingPipelineCreateInfoKHR::default()
-                        .stages(&shader_stages)
-                        .groups(&shader_groups)
-                        .max_pipeline_ray_recursion_depth(1)
-                        .layout(self.pipeline_layout)],
-                    None,
-                )
+        let result = unsafe {
+            self.ctx.device.create_compute_pipelines(
+                vk::PipelineCache::null(),
+                &[
+                    vk::ComputePipelineCreateInfo::default()
+                        .stage(sky_stage)
+                        .layout(self.pipeline_layout),
+                    vk::ComputePipelineCreateInfo::default()
+                        .stage(world_stage)
+                        .layout(self.pipeline_layout),
+                ],
+                None,
+            )
         };
 
         unsafe {
             self.ctx.device.destroy_shader_module(shader_module, None);
         }
 
-        self.pipeline = pipeline_result.map_err(|(_, result)| result)?[0];
+        let pipelines = result.map_err(|(_, result)| result)?;
+        self.compute_sky_pipeline = pipelines[0];
+        self.compute_world_pipeline = pipelines[1];
 
-        Ok(shader_groups.len())
-    }
-
-    #[instrument(skip_all)]
-    pub fn create_shader_binding_table(&mut self, shader_group_count: usize) -> Result<u64> {
-        let handle_size = self
-            .ray_tracing_pipeline_properties
-            .shader_group_handle_size as usize;
-        let handle_alignment = self
-            .ray_tracing_pipeline_properties
-            .shader_group_base_alignment as usize;
-        let handle_size_aligned = (handle_size + handle_alignment - 1) & !(handle_alignment - 1);
-
-        let incoming_table_data = unsafe {
-            self.ray_tracing_pipeline_device
-                .get_ray_tracing_shader_group_handles(
-                    self.pipeline,
-                    0,
-                    shader_group_count as u32,
-                    shader_group_count * handle_size,
-                )
-        }?;
-
-        let table_size = shader_group_count * handle_size_aligned;
-        let mut table_data = vec![0u8; table_size];
-
-        for i in 0..shader_group_count {
-            let src = i * handle_size;
-            let dst = i * handle_size_aligned;
-            table_data[dst..dst + handle_size]
-                .copy_from_slice(&incoming_table_data[src..src + handle_size]);
-        }
-
-        let mut shader_binding_table_buffer = Buffer::new(
-            self.ctx.clone(),
-            table_size as u64,
-            vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::SHADER_BINDING_TABLE_KHR,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )?;
-
-        shader_binding_table_buffer.store(&table_data);
-
-        self.shader_binding_table_buffer = Some(shader_binding_table_buffer);
-
-        Ok(handle_size_aligned as u64)
+        Ok(())
     }
 
     #[instrument(skip_all)]
@@ -863,49 +751,33 @@ impl Application<'_> {
     }
 
     #[instrument(skip_all)]
-    pub fn record_ray_tracing(
+    pub fn dispatch_lighting(
         &self,
-        sbt_handle_size: u64,
         texel_count: usize,
         output_device: &Buffer,
-        output_readback: Option<&Buffer>,
+        output_readback: &Buffer,
     ) -> Result<()> {
-        let sbt_buffer = self
-            .shader_binding_table_buffer
-            .as_ref()
-            .context("SBT buffer not created")?;
+        let cs_stage = vk::PipelineStageFlags2::COMPUTE_SHADER;
 
-        let sbt_address = sbt_buffer.device_address();
+        let groups_x = (texel_count as u32)
+            .div_ceil(shared::COMPUTE_WORKGROUP_SIZE)
+            .min(shared::COMPUTE_X_GROUPS);
+        let groups_y = (texel_count as u32).div_ceil(shared::COMPUTE_X_STRIDE);
 
-        let sbt_raygen_region_sky = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_SKY as u64 * sbt_handle_size)
-            .size(sbt_handle_size)
-            .stride(sbt_handle_size);
-
-        let sbt_raygen_region_world = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_WORLD as u64 * sbt_handle_size)
-            .size(sbt_handle_size)
-            .stride(sbt_handle_size);
-
-        let sbt_raygen_region_gi = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_RAYGEN_GI as u64 * sbt_handle_size)
-            .size(sbt_handle_size)
-            .stride(sbt_handle_size);
-
-        let sbt_miss_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_MISS as u64 * sbt_handle_size)
-            .size(sbt_handle_size)
-            .stride(sbt_handle_size);
-
-        let sbt_hit_region = vk::StridedDeviceAddressRegionKHR::default()
-            .device_address(sbt_address + Self::SBT_GROUP_HIT as u64 * sbt_handle_size)
-            .size(2 * sbt_handle_size)
-            .stride(sbt_handle_size);
-
-        let sbt_call_region = vk::StridedDeviceAddressRegionKHR::default();
+        let output_rw_barrier = || {
+            vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(cs_stage)
+                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(cs_stage)
+                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_device.handle())
+                .offset(0)
+                .size(vk::WHOLE_SIZE)
+        };
 
         let gpu_span = info_span!("GPU");
-        let rt_stage = vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR;
         let entered = gpu_span.enter();
 
         let sky_span = info_span!(
@@ -916,45 +788,51 @@ impl Application<'_> {
             "PASS: World Illumination",
             elapsed_ns = ::tracing::field::Empty
         );
-        let gi_span = info_span!(
-            "PASS: Global Illumination",
-            elapsed_ns = ::tracing::field::Empty
-        );
+
         unsafe {
             self.reset_timestamp_pool(self.command_buffer);
 
-            self.ctx.device.cmd_bind_pipeline(
-                self.command_buffer,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
-                self.pipeline,
-            );
             self.ctx.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
-                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 0,
                 &[self.descriptor_set],
                 &[],
             );
 
-            self.write_timestamp(self.command_buffer, TimestampSlot::SkyBegin, rt_stage);
-            self.ray_tracing_pipeline_device.cmd_trace_rays(
+            self.ctx.device.cmd_bind_pipeline(
                 self.command_buffer,
-                &sbt_raygen_region_sky,
-                &sbt_miss_region,
-                &sbt_hit_region,
-                &sbt_call_region,
-                texel_count as u32,
-                1,
-                1,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_sky_pipeline,
             );
-            self.write_timestamp(self.command_buffer, TimestampSlot::SkyEnd, rt_stage);
+            self.write_timestamp(self.command_buffer, TimestampSlot::SkyBegin, cs_stage);
+            self.ctx
+                .device
+                .cmd_dispatch(self.command_buffer, groups_x, groups_y, 1);
+            self.write_timestamp(self.command_buffer, TimestampSlot::SkyEnd, cs_stage);
 
-            let barrier = vk::BufferMemoryBarrier2::default()
-                .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+            self.ctx.device.cmd_pipeline_barrier2(
+                self.command_buffer,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[output_rw_barrier()]),
+            );
+
+            self.ctx.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_world_pipeline,
+            );
+            self.write_timestamp(self.command_buffer, TimestampSlot::WorldBegin, cs_stage);
+            self.ctx
+                .device
+                .cmd_dispatch(self.command_buffer, groups_x, groups_y, 1);
+            self.write_timestamp(self.command_buffer, TimestampSlot::WorldEnd, cs_stage);
+
+            let to_transfer = vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(cs_stage)
                 .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .buffer(output_device.handle())
@@ -962,107 +840,30 @@ impl Application<'_> {
                 .size(vk::WHOLE_SIZE);
             self.ctx.device.cmd_pipeline_barrier2(
                 self.command_buffer,
-                &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[to_transfer]),
             );
 
-            self.write_timestamp(self.command_buffer, TimestampSlot::WorldBegin, rt_stage);
-            self.ray_tracing_pipeline_device.cmd_trace_rays(
+            self.ctx.device.cmd_copy_buffer(
                 self.command_buffer,
-                &sbt_raygen_region_world,
-                &sbt_miss_region,
-                &sbt_hit_region,
-                &sbt_call_region,
-                texel_count as u32,
-                1,
-                1,
+                output_device.handle(),
+                output_readback.handle(),
+                &[vk::BufferCopy::default().size(output_readback.size())],
             );
-            self.write_timestamp(self.command_buffer, TimestampSlot::WorldEnd, rt_stage);
 
-            self.write_timestamp(self.command_buffer, TimestampSlot::GiBegin, rt_stage);
-            let bounce_count = 1;
-            for _bounce in 0..bounce_count {
-                let barrier = vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(output_device.handle())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-
-                self.ctx.device.cmd_pipeline_barrier2(
-                    self.command_buffer,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&[barrier]),
-                );
-
-                self.ray_tracing_pipeline_device.cmd_trace_rays(
-                    self.command_buffer,
-                    &sbt_raygen_region_gi,
-                    &sbt_miss_region,
-                    &sbt_hit_region,
-                    &sbt_call_region,
-                    texel_count as u32,
-                    1,
-                    1,
-                );
-            }
-            self.write_timestamp(self.command_buffer, TimestampSlot::GiEnd, rt_stage);
-
-            if let Some(readback) = output_readback {
-                let to_transfer = vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(output_device.handle())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier2(
-                    self.command_buffer,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_transfer]),
-                );
-
-                self.ctx.device.cmd_copy_buffer(
-                    self.command_buffer,
-                    output_device.handle(),
-                    readback.handle(),
-                    &[vk::BufferCopy::default().size(readback.size())],
-                );
-
-                let to_host = vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
-                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::HOST)
-                    .dst_access_mask(vk::AccessFlags2::HOST_READ)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(readback.handle())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier2(
-                    self.command_buffer,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_host]),
-                );
-            } else {
-                let to_shader = vk::BufferMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                    .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE)
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .buffer(output_device.handle())
-                    .offset(0)
-                    .size(vk::WHOLE_SIZE);
-                self.ctx.device.cmd_pipeline_barrier2(
-                    self.command_buffer,
-                    &vk::DependencyInfo::default().buffer_memory_barriers(&[to_shader]),
-                );
-            }
+            let to_host = vk::BufferMemoryBarrier2::default()
+                .src_stage_mask(vk::PipelineStageFlags2::ALL_TRANSFER)
+                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                .dst_stage_mask(vk::PipelineStageFlags2::HOST)
+                .dst_access_mask(vk::AccessFlags2::HOST_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .buffer(output_readback.handle())
+                .offset(0)
+                .size(vk::WHOLE_SIZE);
+            self.ctx.device.cmd_pipeline_barrier2(
+                self.command_buffer,
+                &vk::DependencyInfo::default().buffer_memory_barriers(&[to_host]),
+            );
 
             self.ctx.device.end_command_buffer(self.command_buffer)?;
             self.ctx.device.queue_submit(
@@ -1090,15 +891,6 @@ impl Application<'_> {
             self.elapsed_ns(TimestampSlot::WorldBegin, TimestampSlot::WorldEnd)?,
         );
 
-        {
-            let _e = gi_span.enter();
-            self.wait_timestamp(TimestampSlot::GiEnd)?;
-        }
-        gi_span.record(
-            "elapsed_ns",
-            self.elapsed_ns(TimestampSlot::GiBegin, TimestampSlot::GiEnd)?,
-        );
-
         unsafe { self.ctx.device.queue_wait_idle(self.ctx.queue)? };
 
         drop(entered);
@@ -1106,11 +898,16 @@ impl Application<'_> {
     }
 }
 
-impl Drop for Application<'_> {
+impl Drop for Application {
     fn drop(&mut self) {
         unsafe {
             self.ctx.device.device_wait_idle().ok();
-            self.ctx.device.destroy_pipeline(self.pipeline, None);
+            self.ctx
+                .device
+                .destroy_pipeline(self.compute_sky_pipeline, None);
+            self.ctx
+                .device
+                .destroy_pipeline(self.compute_world_pipeline, None);
 
             self.ctx
                 .device

@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+﻿use std::borrow::Cow;
 use std::cell::{Ref, RefMut};
 use std::fs::File;
 use std::path::PathBuf;
@@ -14,8 +14,8 @@ use tracing_timing::TreeTimingLayer;
 use zerocopy::IntoBytes;
 
 use ash::khr::{
-    acceleration_structure, deferred_host_operations, get_memory_requirements2,
-    ray_tracing_pipeline, spirv_1_4,
+    acceleration_structure, deferred_host_operations, get_memory_requirements2, ray_query,
+    spirv_1_4,
 };
 use ash::vk;
 use spirv_std::glam::{Mat3, Vec3};
@@ -644,10 +644,9 @@ fn run(args: Args) -> Result<()> {
     let device_layers = [
         acceleration_structure::NAME,
         deferred_host_operations::NAME,
-        ray_tracing_pipeline::NAME,
+        ray_query::NAME,
         spirv_1_4::NAME,
         get_memory_requirements2::NAME,
-        c"VK_KHR_ray_tracing_position_fetch",
     ];
 
     let ctx = Rc::new(VulkanContext::new(
@@ -663,14 +662,29 @@ fn run(args: Args) -> Result<()> {
     if texels.is_empty() {
         bail!("no texels");
     }
+    let texel_count = texels.len();
 
-    let mut texel_staging = Buffer::new(
-        ctx.clone(),
-        (size_of::<TexelData>() * texels.len()) as u64,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-    )?;
-    texel_staging.store(&texels);
+    let texel_buffer = {
+        let mut texel_staging = Buffer::new(
+            ctx.clone(),
+            (size_of::<TexelData>() * texel_count) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        texel_staging.store(&texels);
+        drop(texels);
+
+        let texel_buffer = Buffer::new(
+            ctx.clone(),
+            texel_staging.size(),
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        texel_buffer.copy_from(&texel_staging, texel_staging.size())?;
+        texel_buffer
+    };
 
     let command_buffer = app.command_buffer;
 
@@ -682,30 +696,21 @@ fn run(args: Args) -> Result<()> {
             .begin_command_buffer(command_buffer, &begin_info)?;
     }
 
-    let texel_buffer = Buffer::new(
-        ctx.clone(),
-        texel_staging.size(),
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-            | vk::BufferUsageFlags::TRANSFER_DST,
-        vk::MemoryPropertyFlags::DEVICE_LOCAL,
-    )?;
-    texel_buffer.cmd_copy_from(command_buffer, &texel_staging, texel_staging.size());
-
     let output_buffer = Buffer::new(
         ctx.clone(),
-        (size_of::<AlignedVec3>() * texels.len()) as u64,
+        (size_of::<AlignedVec3>() * texel_count) as u64,
         vk::BufferUsageFlags::STORAGE_BUFFER
             | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
             | vk::BufferUsageFlags::TRANSFER_SRC,
         vk::MemoryPropertyFlags::DEVICE_LOCAL,
     )?;
 
-    let output_readback = Buffer::new(
+    let output_readback = Buffer::new_with_preferred(
         ctx.clone(),
         output_buffer.size(),
         vk::BufferUsageFlags::TRANSFER_DST,
         vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        vk::MemoryPropertyFlags::HOST_CACHED,
     )?;
 
     let (mut geometry_vertices, solid_indices) = collect_brush_geometry(&bsp)?;
@@ -763,7 +768,7 @@ fn run(args: Args) -> Result<()> {
         world_buffer.cmd_copy_from(command_buffer, &world_staging, world_bytes);
     }
 
-    let init_to_rt_barrier = vk::MemoryBarrier2::default()
+    let init_to_compute_barrier = vk::MemoryBarrier2::default()
         .src_stage_mask(
             vk::PipelineStageFlags2::ACCELERATION_STRUCTURE_BUILD_KHR
                 | vk::PipelineStageFlags2::ALL_TRANSFER,
@@ -771,7 +776,7 @@ fn run(args: Args) -> Result<()> {
         .src_access_mask(
             vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR | vk::AccessFlags2::TRANSFER_WRITE,
         )
-        .dst_stage_mask(vk::PipelineStageFlags2::RAY_TRACING_SHADER_KHR)
+        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
         .dst_access_mask(
             vk::AccessFlags2::ACCELERATION_STRUCTURE_READ_KHR | vk::AccessFlags2::SHADER_READ,
         );
@@ -779,24 +784,17 @@ fn run(args: Args) -> Result<()> {
     unsafe {
         ctx.device.cmd_pipeline_barrier2(
             command_buffer,
-            &vk::DependencyInfo::default().memory_barriers(&[init_to_rt_barrier]),
+            &vk::DependencyInfo::default().memory_barriers(&[init_to_compute_barrier]),
         );
     }
 
-    let shader_group_count = app.create_pipeline()?;
-    let sbt_handle_size = app.create_shader_binding_table(shader_group_count)?;
-
+    app.create_pipelines()?;
     app.create_descriptor_set(&texel_buffer, &output_buffer, &sky_buffer, &world_buffer)?;
-    app.record_ray_tracing(
-        sbt_handle_size,
-        texels.len(),
-        &output_buffer,
-        Some(&output_readback),
-    )?;
+    app.dispatch_lighting(texel_count, &output_buffer, &output_readback)?;
 
     drop(setup_buffers);
 
-    let lighting: Vec<AlignedVec3> = output_readback.load(texels.len());
+    let lighting: Vec<AlignedVec3> = output_readback.load(texel_count);
 
     // Drop immutable ref so we can take mutable ref
     drop(faces);

@@ -181,12 +181,8 @@ impl VulkanContext {
             vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
                 .acceleration_structure(true);
 
-        let mut raytracing_pipeline_features =
-            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default().ray_tracing_pipeline(true);
-
-        let mut ray_tracing_position_fetch_features =
-            vk::PhysicalDeviceRayTracingPositionFetchFeaturesKHR::default()
-                .ray_tracing_position_fetch(true);
+        let mut ray_query_features =
+            vk::PhysicalDeviceRayQueryFeaturesKHR::default().ray_query(true);
 
         let mut features13 = vk::PhysicalDeviceVulkan13Features::default().synchronization2(true);
 
@@ -199,8 +195,7 @@ impl VulkanContext {
             .push_next(&mut features2)
             .push_next(&mut features12)
             .push_next(&mut acceleration_structure_features)
-            .push_next(&mut raytracing_pipeline_features)
-            .push_next(&mut ray_tracing_position_fetch_features)
+            .push_next(&mut ray_query_features)
             .push_next(&mut features13)
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(enabled_extension_names.as_slice());

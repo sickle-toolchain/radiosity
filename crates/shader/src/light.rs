@@ -1,14 +1,12 @@
-use spirv_std::glam::{Vec2, Vec3};
-use spirv_std::ray_tracing::{AccelerationStructure, RayFlags};
+﻿use spirv_std::glam::{Vec2, Vec3};
+use spirv_std::ray_tracing::{AccelerationStructure, CommittedIntersection, RayFlags, RayQuery};
 
 #[allow(unused_imports)]
 use spirv_std::num_traits::Float;
 
 use core::f32::consts::PI;
 
-use shared::{EmitType, Light, MASK_ALL, MASK_SOLID, Sky, TexelData};
-
-use crate::{HitKind, RayPayload};
+use shared::{EmitType, INSTANCE_SOLID, Light, MASK_ALL, MASK_SOLID, Sky, TexelData};
 
 pub const SHADOW_EPSILON: f32 = 0.25;
 
@@ -16,6 +14,8 @@ const RAY_TMIN: f32 = 0.001;
 const RAY_TMAX: f32 = 1.0e6;
 
 const AMBIENT_SAMPLES: u32 = 16;
+
+const MIN_CONTRIBUTION: f32 = 1.0e-3;
 
 fn radical_inverse_base2(mut bits: u32) -> f32 {
     bits = (bits << 16) | (bits >> 16);
@@ -57,6 +57,7 @@ fn sample_cone(axis: Vec3, sin_radius: f32, u: Vec2) -> Vec3 {
     if sin_radius <= 0.0 {
         return axis;
     }
+
     let cos_max = (1.0 - sin_radius * sin_radius).max(0.0).sqrt();
     let cos_theta = 1.0 - u.x * (1.0 - cos_max);
     let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
@@ -65,13 +66,62 @@ fn sample_cone(axis: Vec3, sin_radius: f32, u: Vec2) -> Vec3 {
     (t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + axis * cos_theta).normalize()
 }
 
+fn committed_hit(
+    tlas: &AccelerationStructure,
+    flags: RayFlags,
+    cull_mask: u32,
+    origin: Vec3,
+    dir: Vec3,
+    t_max: f32,
+) -> (CommittedIntersection, u32) {
+    spirv_std::ray_query!(let mut rq);
+    unsafe {
+        rq.initialize(tlas, flags, cull_mask, origin, RAY_TMIN, dir, t_max);
+        while rq.proceed() {}
+
+        let ty = rq.get_committed_intersection_type();
+        let instance = if matches!(ty, CommittedIntersection::Triangle) {
+            rq.get_committed_intersection_instance_id()
+        } else {
+            u32::MAX
+        };
+
+        (ty, instance)
+    }
+}
+
+fn nearest_is_solid(tlas: &AccelerationStructure, origin: Vec3, dir: Vec3) -> bool {
+    let (ty, instance) = committed_hit(
+        tlas,
+        RayFlags::OPAQUE,
+        MASK_ALL as u32,
+        origin,
+        dir,
+        RAY_TMAX,
+    );
+
+    matches!(ty, CommittedIntersection::Triangle) && instance == INSTANCE_SOLID
+}
+
+fn occluded_by_solid(tlas: &AccelerationStructure, origin: Vec3, dir: Vec3, t_max: f32) -> bool {
+    let (ty, _) = committed_hit(
+        tlas,
+        RayFlags::OPAQUE | RayFlags::TERMINATE_ON_FIRST_HIT,
+        MASK_SOLID as u32,
+        origin,
+        dir,
+        t_max,
+    );
+
+    !matches!(ty, CommittedIntersection::None)
+}
+
 #[inline(always)]
 pub fn contribute_sky(
     sky: &Sky,
     sample_pos: Vec3,
     sample_normal: Vec3,
     tlas: &AccelerationStructure,
-    payload: &mut RayPayload,
     sample_index: u32,
     samples_per_luxel: u32,
 ) -> Vec3 {
@@ -91,27 +141,14 @@ pub fn contribute_sky(
             if cos_w <= 0.0 {
                 continue;
             }
+
             total_weight += cos_w;
 
-            *payload = HitKind::Miss;
-            unsafe {
-                tlas.trace_ray(
-                    RayFlags::OPAQUE,
-                    MASK_ALL as i32,
-                    0,
-                    0,
-                    0,
-                    ray_origin,
-                    RAY_TMIN,
-                    dir,
-                    RAY_TMAX,
-                    payload,
-                );
-            }
-            if !matches!(payload, HitKind::Hit) {
+            if !nearest_is_solid(tlas, ray_origin, dir) {
                 weighted_visible += cos_w;
             }
         }
+
         if total_weight > 0.0 {
             result += ambient * (weighted_visible / total_weight);
         }
@@ -125,23 +162,7 @@ pub fn contribute_sky(
             let u = hammersley(sample_index, samples_per_luxel);
             let ray_dir = sample_cone(to_sun, sky.sun_spread, u);
 
-            *payload = HitKind::Miss;
-            unsafe {
-                tlas.trace_ray(
-                    RayFlags::OPAQUE,
-                    MASK_ALL as i32,
-                    0,
-                    0,
-                    0,
-                    ray_origin,
-                    RAY_TMIN,
-                    ray_dir,
-                    RAY_TMAX,
-                    payload,
-                );
-            }
-
-            if !matches!(payload, HitKind::Hit) {
+            if !nearest_is_solid(tlas, ray_origin, ray_dir) {
                 result += sun_color * n_dot_l;
             }
         }
@@ -167,6 +188,7 @@ fn spotlight_penumbra(light: &Light, to_light: Vec3) -> Option<f32> {
         } else {
             t
         };
+
         Some(scale)
     } else {
         Some(1.0)
@@ -198,7 +220,6 @@ pub fn contribute_positional(
     sample_pos: Vec3,
     sample_normal: Vec3,
     tlas: &AccelerationStructure,
-    payload: &mut RayPayload,
 ) -> Vec3 {
     let diff = sample_pos - light.position.0;
     let dist = diff.length();
@@ -248,30 +269,17 @@ pub fn contribute_positional(
         distance_attenuation(light, dist)
     };
 
-    let ray_origin = sample_pos + sample_normal * SHADOW_EPSILON;
-    let t_max = (dist - SHADOW_EPSILON * cos_angle).max(0.0);
-
-    *payload = HitKind::Hit;
-    unsafe {
-        tlas.trace_ray(
-            RayFlags::OPAQUE
-                | RayFlags::TERMINATE_ON_FIRST_HIT
-                | RayFlags::SKIP_CLOSEST_HIT_SHADER,
-            MASK_SOLID as i32,
-            0,
-            0,
-            0,
-            ray_origin,
-            RAY_TMIN,
-            to_light,
-            t_max,
-            payload,
-        );
-    }
-
-    if matches!(payload, HitKind::Hit) {
+    let contribution = light.color.0 * (n_dot_l * angular * falloff);
+    if contribution.x.max(contribution.y).max(contribution.z) < MIN_CONTRIBUTION {
         return Vec3::ZERO;
     }
 
-    light.color.0 * (n_dot_l * angular * falloff)
+    let ray_origin = sample_pos + sample_normal * SHADOW_EPSILON;
+    let t_max = (dist - SHADOW_EPSILON * cos_angle).max(0.0);
+
+    if occluded_by_solid(tlas, ray_origin, to_light, t_max) {
+        return Vec3::ZERO;
+    }
+
+    contribution
 }

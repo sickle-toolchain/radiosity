@@ -25,6 +25,22 @@ impl Buffer {
         usage: vk::BufferUsageFlags,
         memory_properties: vk::MemoryPropertyFlags,
     ) -> VkResult<Self> {
+        Self::new_with_preferred(
+            ctx,
+            size,
+            usage,
+            memory_properties,
+            vk::MemoryPropertyFlags::empty(),
+        )
+    }
+
+    pub fn new_with_preferred(
+        ctx: Rc<VulkanContext>,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        memory_properties: vk::MemoryPropertyFlags,
+        preferred: vk::MemoryPropertyFlags,
+    ) -> VkResult<Self> {
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
@@ -35,7 +51,11 @@ impl Buffer {
 
         let memory_index = ctx
             .physical_device_memory_properties
-            .mem_ty_idx(memory_req.memory_type_bits, memory_properties)
+            .mem_ty_idx(memory_req.memory_type_bits, memory_properties | preferred)
+            .or_else(|| {
+                ctx.physical_device_memory_properties
+                    .mem_ty_idx(memory_req.memory_type_bits, memory_properties)
+            })
             .expect("Failed to get memory type");
 
         let mut allocate_info_builder = vk::MemoryAllocateInfo::default();
