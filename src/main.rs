@@ -393,7 +393,7 @@ fn collect_lights<'a>(bsp: &'a Bsp<'a>) -> Result<(Vec<shared::Light>, shared::S
         let end = raw.find('\0').unwrap_or(raw.len());
         raw[..end].to_owned()
     };
-    let entities = match valve_kv::parse(&entity_string) {
+    let entities = match entities_lump_parser::parse(&entity_string) {
         Ok(entities) => entities,
         Err(e) => {
             warn!("failed to parse entity lump: {e}");

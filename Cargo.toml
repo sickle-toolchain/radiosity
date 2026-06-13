@@ -32,10 +32,10 @@ ash-linked = ["ash/linked"]
 [dependencies]
 bsp = { git = "https://github.com/sickle-toolchain/bsp" }
 lump-definitions = { git = "https://github.com/sickle-toolchain/lump-definitions" }
+entities-lump-parser = { git = "https://github.com/sickle-toolchain/entities-lump-parser" }
 shared = { workspace = true }
 spirv-std = { workspace = true }
 tracing-timing = { workspace = true }
-valve-kv = { path = "crates/valve-kv" }
 
 clap = { version = "4.5.29", features = ["derive"] }
 zerocopy = "0.8.20"
