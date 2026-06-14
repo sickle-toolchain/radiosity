@@ -85,10 +85,6 @@ struct Args {
     /// Force use of specific device id
     #[arg(help_heading = "vulkan", long)]
     device_id: Option<u32>,
-
-    /// Lightmap resolution multiplier
-    #[arg(help_heading = "bsp", long, default_value = "1")]
-    lightmap_scale: u32,
 }
 
 fn luxel_to_world_matrix<'a>(face: &Face, bsp: &'a Bsp<'a>) -> Mat3 {
@@ -136,7 +132,7 @@ fn is_lightmapped<'a>(face: &Face, bsp: &'a Bsp<'a>) -> bool {
 }
 
 #[instrument(skip_all)]
-fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face], lightmap_scale: u32) -> Vec<TexelData> {
+fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face]) -> Vec<TexelData> {
     let mut texels = Vec::new();
 
     for face in faces {
@@ -147,16 +143,10 @@ fn generate_texels<'a>(bsp: &'a Bsp<'a>, faces: &[Face], lightmap_scale: u32) ->
         let plane: Ref<'_, Plane> = face.associated(bsp);
         let normal = Vec3::from_array(plane.normal).normalize();
 
-        let width = (face.lightmap.maxs[0] + 1) as u32 * lightmap_scale;
-        let height = (face.lightmap.maxs[1] + 1) as u32 * lightmap_scale;
+        let width = (face.lightmap.maxs[0] + 1) as u32;
+        let height = (face.lightmap.maxs[1] + 1) as u32;
 
-        let base_matrix = luxel_to_world_matrix(face, bsp);
-        let inv_scale = 1.0 / lightmap_scale as f32;
-        let matrix = Mat3::from_cols(
-            base_matrix.col(0) * inv_scale,
-            base_matrix.col(1) * inv_scale,
-            base_matrix.col(2),
-        );
+        let matrix = luxel_to_world_matrix(face, bsp);
         let tangent = matrix.col(0);
         let bitangent = matrix.col(1);
 
@@ -533,37 +523,9 @@ fn encode_rgbexp32(color: Vec3) -> ColorRGBExp32 {
 }
 
 #[instrument(skip_all)]
-fn write_lightmap<'a>(
-    bsp: &'a Bsp<'a>,
-    lighting: &[AlignedVec3],
-    lightmap_scale: u32,
-) -> Result<()> {
+fn write_lightmap<'a>(bsp: &'a Bsp<'a>, lighting: &[AlignedVec3]) -> Result<()> {
     let mut faces = bsp.get_lump_mut::<[Face]>(LumpDefinition::Faces)?;
     let mut faces_hdr = bsp.get_lump_mut::<[Face]>(LumpDefinition::FacesHdr).ok();
-
-    if lightmap_scale > 1 {
-        let scale = lightmap_scale as f32;
-        let mut texinfos = bsp.get_lump_mut::<[TextureInfo]>(LumpDefinition::TextureInfo)?;
-        for ti in texinfos.iter_mut() {
-            for axis in &mut ti.luxels {
-                axis.xyz[0] *= scale;
-                axis.xyz[1] *= scale;
-                axis.xyz[2] *= scale;
-                axis.offset *= scale;
-            }
-        }
-
-        for face in faces.iter_mut() {
-            face.lightmap.mins[0] *= lightmap_scale as i32;
-            face.lightmap.mins[1] *= lightmap_scale as i32;
-        }
-        if let Some(hdr) = &mut faces_hdr {
-            for face in hdr.iter_mut() {
-                face.lightmap.mins[0] *= lightmap_scale as i32;
-                face.lightmap.mins[1] *= lightmap_scale as i32;
-            }
-        }
-    }
 
     let mut lightmap_samples: Vec<ColorRGBExp32> = Vec::with_capacity(lighting.len() + faces.len());
     let mut byte_offset: i32 = 0;
@@ -580,12 +542,9 @@ fn write_lightmap<'a>(
             continue;
         }
 
-        let width = ((face.lightmap.maxs[0] + 1) as u32 * lightmap_scale) as usize;
-        let height = ((face.lightmap.maxs[1] + 1) as u32 * lightmap_scale) as usize;
+        let width = (face.lightmap.maxs[0] + 1) as usize;
+        let height = (face.lightmap.maxs[1] + 1) as usize;
         let luxel_count = width * height;
-
-        face.lightmap.maxs[0] = (width as i32) - 1;
-        face.lightmap.maxs[1] = (height as i32) - 1;
 
         let end = (texel_offset + luxel_count).min(lighting.len());
         let face_texels = &lighting[texel_offset..end];
@@ -658,7 +617,7 @@ fn run(args: Args) -> Result<()> {
 
     let faces = bsp.get_lump::<[Face]>(LumpDefinition::Faces)?;
 
-    let texels = generate_texels(&bsp, &faces, args.lightmap_scale);
+    let texels = generate_texels(&bsp, &faces);
     if texels.is_empty() {
         bail!("no texels");
     }
@@ -798,7 +757,7 @@ fn run(args: Args) -> Result<()> {
 
     // Drop immutable ref so we can take mutable ref
     drop(faces);
-    write_lightmap(&bsp, &lighting, args.lightmap_scale)?;
+    write_lightmap(&bsp, &lighting)?;
 
     bsp.write_to_io(&mut File::create(&args.output)?)
         .context("writing to io failed")?;
