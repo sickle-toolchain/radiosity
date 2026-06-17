@@ -3,7 +3,7 @@
     ~sickle-toolchain/</a>radiosity
   </h3>
 
-BSP Lightmap Compiler
+GPU-Accelerated BSP Lightmap Compiler
 </div>
 
 ##
