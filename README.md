@@ -1,6 +1,6 @@
 <div align="center">
-  <h3><a href="https://github.com/sickle-toolchain">
-    ~sickle-toolchain/</a>radiosity
+  <h3><a href="https://github.com/kusabana">
+    ~kusabana/</a>sickle-radiosity
   </h3>
 
 GPU-Accelerated BSP Lightmap Compiler
